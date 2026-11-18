@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
 const GIST_DESCRIPTION: &str = "Hex settings (hex-gist-sync)";
+const GIST_FORMAT: &str = "hex-gist-sync/v1";
+const HISTORY_LIMIT: usize = 50;
 const SENTINEL: &str = "__HEX_SYNC_LOCAL__";
 
 // Values that belong to one machine only. Their whole subtree is replaced by a sentinel.
@@ -34,6 +36,7 @@ enum CommandKind {
     Pull,
     Diff,
     Watch { interval: u64 },
+    History { revisions: bool },
     InstallService,
     UninstallService,
     Help,
@@ -68,6 +71,7 @@ fn run() -> Result<()> {
         CommandKind::Pull => cmd_pull(&options),
         CommandKind::Diff => cmd_diff(&options),
         CommandKind::Watch { interval } => cmd_watch(&options, *interval),
+        CommandKind::History { revisions } => cmd_history(&options, *revisions),
         CommandKind::InstallService => install_service(),
         CommandKind::UninstallService => uninstall_service(),
     }
@@ -84,12 +88,16 @@ fn print_help() {
            pull             Download settings from the gist, preserving local secrets.\n\
            diff             Show whether the local file and the gist diverged.\n\
            watch             Run a daemon that syncs changes automatically.\n\
+           history           Show which machines changed the gist.\n\
            install-service   Install the daemon as a systemd user service or scheduled task.\n\
            uninstall-service Remove the automatic sync service.\n\
            help              Show this help.\n\
          \n\
          Watch options:\n\
            --interval <seconds>  Poll interval, default 15 (or HEX_SYNC_INTERVAL).\n\
+         \n\
+         History options:\n\
+           --revisions           Show native GitHub gist revisions instead.\n\
          \n\
          Environment variables:\n\
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
@@ -160,6 +168,22 @@ fn parse_args() -> Result<Options> {
             }
 
             CommandKind::Watch { interval }
+        }
+        Some("history") => {
+            let revisions = args
+                .iter()
+                .skip(1)
+                .any(|argument| argument == "--revisions");
+
+            if let Some(unknown) = args
+                .iter()
+                .skip(1)
+                .find(|argument| argument.as_str() != "--revisions")
+            {
+                bail!("Unknown history option: {unknown}");
+            }
+
+            CommandKind::History { revisions }
         }
         Some("install-service") => CommandKind::InstallService,
         Some("uninstall-service") => CommandKind::UninstallService,
@@ -607,6 +631,123 @@ fn write_settings(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // Howard Hinnant's civil calendar conversion, valid for the Unix epoch and beyond.
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+
+    if month <= 2 {
+        year += 1;
+    }
+
+    (year, month, day)
+}
+
+fn format_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let time = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
+}
+
+fn machine_name() -> String {
+    env::var("HOSTNAME")
+        .or_else(|_| env::var("COMPUTERNAME"))
+        .or_else(|_| fs::read_to_string("/etc/hostname").map(|name| name.trim().to_string()))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn user_name() -> String {
+    env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn history_entry(action: &str) -> Value {
+    let mut entry = Map::new();
+    entry.insert("at".to_string(), Value::String(format_timestamp()));
+    entry.insert("machine".to_string(), Value::String(machine_name()));
+    entry.insert("user".to_string(), Value::String(user_name()));
+    entry.insert(
+        "os".to_string(),
+        Value::String(env::consts::OS.to_string()),
+    );
+    entry.insert("action".to_string(), Value::String(action.to_string()));
+    Value::Object(entry)
+}
+
+fn extract_settings(document: &Value) -> Result<Value> {
+    if document.get("format").and_then(Value::as_str) == Some(GIST_FORMAT) {
+        if let Some(settings) = document.get("settings") {
+            if settings.is_object() {
+                return Ok(settings.clone());
+            }
+        }
+    }
+
+    // Gists created by earlier versions contain the settings object directly.
+    if document.is_object() {
+        return Ok(document.clone());
+    }
+
+    bail!("The gist file must contain a JSON object")
+}
+
+fn extract_history(document: &Value) -> Vec<Value> {
+    document
+        .get("signature")
+        .and_then(|signature| signature.get("history"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn build_document(settings: &Value, history: &[Value]) -> Value {
+    let mut signature = Map::new();
+    signature.insert("tool".to_string(), Value::String("hex-gist-sync".to_string()));
+    signature.insert("version".to_string(), Value::from(1));
+    signature.insert("history".to_string(), Value::Array(history.to_vec()));
+
+    let mut document = Map::new();
+    document.insert("format".to_string(), Value::String(GIST_FORMAT.to_string()));
+    document.insert("signature".to_string(), Value::Object(signature));
+    document.insert("settings".to_string(), settings.clone());
+    Value::Object(document)
+}
+
+fn fetch_document(options: &Options, id: &str) -> Result<Value> {
+    let raw = fetch_remote_raw(options, id)?;
+    let document: Value = serde_json::from_str(&raw).context("The gist file is not valid JSON")?;
+
+    if !document.is_object() {
+        bail!("The gist file must contain a JSON object");
+    }
+
+    Ok(document)
+}
+
 fn fetch_remote_raw(options: &Options, id: &str) -> Result<String> {
     let raw = run_gh(
         &[
@@ -624,21 +765,18 @@ fn fetch_remote_raw(options: &Options, id: &str) -> Result<String> {
 }
 
 fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
-    let raw = fetch_remote_raw(options, id)?;
-    let value: Value = serde_json::from_str(&raw).context("The gist file is not valid JSON")?;
-
-    if !value.is_object() {
-        bail!("The gist file must contain a JSON object");
-    }
-
-    Ok(value)
+    let document = fetch_document(options, id)?;
+    extract_settings(&document)
 }
 
 fn cmd_init(options: &Options, public: bool) -> Result<()> {
     require_auth()?;
 
     let settings = read_settings(&options.settings_path)?;
-    let sanitized = to_json_string(&sanitize(&settings, &[]))?;
+    let sanitized = to_json_string(&build_document(
+        &sanitize(&settings, &[]),
+        &[history_entry("init")],
+    ))?;
 
     let mut arguments = vec![
         "gist".to_string(),
@@ -681,14 +819,23 @@ fn cmd_use(options: &Options, value: &str) -> Result<()> {
 fn cmd_push(options: &Options) -> Result<()> {
     require_auth()?;
     let id = resolve_gist_id(options)?;
-    push_to_gist(options, &id)?;
+    push_to_gist(options, &id, "push")?;
     println!("Settings uploaded to gist {id}.");
     Ok(())
 }
 
-fn push_to_gist(options: &Options, id: &str) -> Result<()> {
+fn push_to_gist(options: &Options, id: &str, action: &str) -> Result<()> {
     let settings = read_settings(&options.settings_path)?;
-    let sanitized = to_json_string(&sanitize(&settings, &[]))?;
+    let document = fetch_document(options, id)?;
+    let mut history = extract_history(&document);
+    history.push(history_entry(action));
+
+    if history.len() > HISTORY_LIMIT {
+        let excess = history.len() - HISTORY_LIMIT;
+        history.drain(..excess);
+    }
+
+    let sanitized = to_json_string(&build_document(&sanitize(&settings, &[]), &history))?;
     let temporary = TempFile::new(&sanitized)?;
     let path = temporary.path.to_string_lossy().into_owned();
 
@@ -784,6 +931,65 @@ fn local_snapshot(options: &Options) -> Result<String> {
         .to_string())
 }
 
+fn remote_snapshot(options: &Options, id: &str) -> Result<String> {
+    let document = fetch_document(options, id)?;
+    let settings = extract_settings(&document)?;
+    Ok(to_json_string(&settings)?.trim_end().to_string())
+}
+
+fn cmd_history(options: &Options, revisions: bool) -> Result<()> {
+    require_auth()?;
+
+    let id = resolve_gist_id(options)?;
+
+    if revisions {
+        let raw = run_gh(
+            &["api", &format!("gists/{id}/revisions?per_page=100")],
+            None,
+        )?;
+        let response: Value = serde_json::from_str(&raw).context("Invalid response from gh api")?;
+        let items = response
+            .as_array()
+            .context("Unexpected gist revisions response")?;
+
+        println!("GitHub gist revisions: {}", items.len());
+
+        for revision in items.iter().take(20) {
+            let time = revision
+                .get("committed_at")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown time");
+            let changes = revision.get("change_status").map(Value::to_string);
+            match changes {
+                Some(changes) => println!("  {time}  {changes}"),
+                None => println!("  {time}"),
+            }
+        }
+
+        return Ok(());
+    }
+
+    let document = fetch_document(options, &id)?;
+    let history = extract_history(&document);
+
+    if history.is_empty() {
+        println!("No signature history in this gist yet.");
+        return Ok(());
+    }
+
+    for entry in history {
+        let time = entry.get("at").and_then(Value::as_str).unwrap_or("?");
+        let machine = entry.get("machine").and_then(Value::as_str).unwrap_or("?");
+        let user = entry.get("user").and_then(Value::as_str).unwrap_or("?");
+        let os = entry.get("os").and_then(Value::as_str).unwrap_or("?");
+        let action = entry.get("action").and_then(Value::as_str).unwrap_or("?");
+
+        println!("{time} | {action} | {machine} | {user} | {os}");
+    }
+
+    Ok(())
+}
+
 fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
     require_auth()?;
 
@@ -795,7 +1001,7 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
     }
 
     let mut local_baseline = local_snapshot(options)?;
-    let mut remote_baseline = fetch_remote_raw(options, &id)?;
+    let mut remote_baseline = remote_snapshot(options, &id)?;
     let mut conflict_reported = false;
 
     println!("[watch] Watching every {interval}s. Press Ctrl+C to stop.");
@@ -811,7 +1017,7 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
             }
         };
 
-        let remote = match fetch_remote_raw(options, &id) {
+        let remote = match remote_snapshot(options, &id) {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("[watch] Could not read gist: {error:#}");
@@ -836,11 +1042,17 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
         }
 
         if local_changed {
-            match push_to_gist(options, &id) {
+            match push_to_gist(options, &id, "watch") {
                 Ok(()) => {
                     println!("[watch] Pushed local changes to gist {id}.");
                     local_baseline = local;
-                    remote_baseline = local_baseline.clone();
+                    remote_baseline = match remote_snapshot(options, &id) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("[watch] Could not re-read gist: {error:#}");
+                            remote_baseline.clone()
+                        }
+                    };
                     conflict_reported = false;
                 }
                 Err(error) => eprintln!("[watch] Push failed: {error:#}"),

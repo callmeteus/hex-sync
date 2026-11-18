@@ -18,6 +18,7 @@ Hex Gist Sync is a small Rust CLI that keeps the portable parts of Hex's `settin
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Automatic sync](#automatic-sync)
+- [Change history](#change-history)
 - [What stays local](#what-stays-local)
 - [Configuration](#configuration)
 - [Platform details](#platform-details)
@@ -35,6 +36,7 @@ This tool syncs the settings you actually want to share and leaves everything el
 
 - Bidirectional sync through a GitHub gist: `push`, `pull` and a read-only `diff`.
 - An optional daemon that watches both sides and syncs changes automatically.
+- A signed change log inside the gist that records which machine, user and OS changed it.
 - Works on Linux and Windows with the same commands and the same gist.
 - Secret gist by default, with an opt-in `--public` flag.
 - Credentials and machine-specific fields are replaced before upload and restored on download.
@@ -114,6 +116,7 @@ HEX_GIST_ID=0123456789abcdef0123456789abcdef hex-gist-sync pull
 | `pull` | Download settings and merge local values back into them. |
 | `diff` | List the paths that differ between the local file and the gist. |
 | `watch [--interval <seconds>]` | Run the sync daemon in the foreground. |
+| `history [--revisions]` | Show the signed change log, or native GitHub gist revisions. |
 | `install-service` | Install the daemon as a systemd user service or a scheduled task. |
 | `uninstall-service` | Remove the automatic sync service. |
 | `help` | Print usage and environment variables. |
@@ -147,6 +150,49 @@ hex-gist-sync install-service
 Remove it with `hex-gist-sync uninstall-service`. On Linux this disables and deletes the service file; on Windows it deletes the scheduled task.
 
 The service inherits the gist ID from the local state file. If you rely on `HEX_GIST_*` environment variables instead, run `install-service` from a shell where those variables are set so they can be written into the service definition. Authentication comes from the GitHub CLI config, so no token is stored in the service file.
+
+## Change history
+
+GitHub gists keep their own revisions, but those revisions do not record which machine made a change. Hex Gist Sync therefore writes a signature block into the gist file itself:
+
+```json
+{
+  "format": "hex-gist-sync/v1",
+  "signature": {
+    "tool": "hex-gist-sync",
+    "version": 1,
+    "history": [
+      {
+        "at": "2026-11-18T19:23:01Z",
+        "machine": "linux-box",
+        "user": "gio",
+        "os": "linux",
+        "action": "push"
+      }
+    ]
+  },
+  "settings": { "...": "..." }
+}
+```
+
+Every `push`, `init` and daemon sync appends an entry with the hostname, user, OS, UTC timestamp and action. The last 50 entries are kept. The wrapper is stripped on `pull`, so your local `settings.json` never sees this metadata.
+
+```bash
+hex-gist-sync history
+```
+
+```text
+2026-11-18T19:23:01Z | init | linux-box | gio | linux
+2026-11-18T19:23:01Z | push | win-box  | teus | windows
+```
+
+To see GitHub's own revision list instead:
+
+```bash
+hex-gist-sync history --revisions
+```
+
+Gists created by older versions contain plain settings and still work. The first push upgrades them to the signed format.
 
 ## What stays local
 
