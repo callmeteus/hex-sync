@@ -17,7 +17,37 @@ const SENTINEL: &str = "__HEX_SYNC_LOCAL__";
 
 // Values that belong to one machine only. Their whole subtree is replaced by a sentinel.
 const LOCAL_PATHS: &[&[&str]] = &[
+    // Audio input and transcription model are tied to the machine hardware.
     &["microphone"],
+    &["avoid_bluetooth_microphone"],
+    &["transcription", "model"],
+    &["transcription_device"],
+    &["transcription_recents"],
+    &["keyboard_model_switching"],
+    &["experimental", "hex_microphone"],
+    &["experimental", "hex_microphone_mode"],
+    &["experimental", "hex_microphone_comfort_noise"],
+    &["experimental", "hex_microphone_strength"],
+    // Shortcuts and keyboard behavior stay on the machine where they were configured.
+    &["shortcut_mode"],
+    &["double_tap_lock"],
+    &["double_tap_only"],
+    &["dictation_hotkey"],
+    &["paste_last_hotkey"],
+    &["cancel_hotkey"],
+    &["raw_dictation_hotkey"],
+    &["typed_text_hotkey"],
+    &["second_dictation_hotkey"],
+    &["extra_dictation_hotkeys"],
+    &["terminal_paste_hotkey"],
+    &["capture", "hotkey"],
+    &["capture", "replay_hotkey"],
+    &["capture", "transcriber"],
+    &["screenshots", "hotkey"],
+    &["screenshots", "record_hotkey"],
+    &["gnome_keyboard_shortcuts"],
+    &["share_dictation_shortcut"],
+    // Paths, integration endpoints and app bookkeeping.
     &["meetings", "output_folder"],
     &["capture", "folder"],
     &["screenshots", "folder"],
@@ -114,10 +144,7 @@ fn parse_args() -> Result<Options> {
 
     let command = match args.first().map(String::as_str) {
         Some("init") => {
-            let public = args
-                .iter()
-                .skip(1)
-                .any(|argument| argument == "--public")
+            let public = args.iter().skip(1).any(|argument| argument == "--public")
                 || env::var("HEX_GIST_PUBLIC")
                     .map(|value| value == "1")
                     .unwrap_or(false);
@@ -153,10 +180,14 @@ fn parse_args() -> Result<Options> {
                     let value = args
                         .get(index + 1)
                         .context("Missing value for --interval")?;
-                    interval = value.parse().context("Interval must be a number of seconds")?;
+                    interval = value
+                        .parse()
+                        .context("Interval must be a number of seconds")?;
                     index += 2;
                 } else if let Some(value) = args[index].strip_prefix("--interval=") {
-                    interval = value.parse().context("Interval must be a number of seconds")?;
+                    interval = value
+                        .parse()
+                        .context("Interval must be a number of seconds")?;
                     index += 1;
                 } else {
                     bail!("Unknown watch option: {}", args[index]);
@@ -275,7 +306,10 @@ fn default_state_file() -> PathBuf {
 
 fn normalize_id(value: &str) -> Result<String> {
     let id = if value.starts_with("http") {
-        value.rsplit('/').find(|part| !part.is_empty()).unwrap_or(value)
+        value
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(value)
     } else {
         value
     };
@@ -300,7 +334,14 @@ fn is_local_path(path: &[String]) -> bool {
 fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     [
-        "apikey", "api_key", "api-key", "token", "secret", "password", "passwd", "credential",
+        "apikey",
+        "api_key",
+        "api-key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
         "auth",
     ]
     .iter()
@@ -308,11 +349,8 @@ fn is_secret_key(key: &str) -> bool {
 }
 
 fn sanitize(value: &Value, path: &[String]) -> Value {
-    let is_local = is_local_path(path)
-        || path
-            .last()
-            .map(|key| is_secret_key(key))
-            .unwrap_or(false);
+    let is_local =
+        is_local_path(path) || path.last().map(|key| is_secret_key(key)).unwrap_or(false);
 
     if is_local {
         return Value::String(SENTINEL.to_string());
@@ -371,15 +409,13 @@ fn set_path(root: &mut Value, path: &[String], value: Value) {
     }
 
     let last = path.last().unwrap();
-    current
-        .as_object_mut()
-        .unwrap()
-        .insert(last.clone(), value);
+    current.as_object_mut().unwrap().insert(last.clone(), value);
 }
 
-fn merge(remote: &Value, local: Option<&Value>, path: &[String]) -> Value {
+fn merge(remote: &Value, local: Option<&Value>, path: &[String]) -> Option<Value> {
     if is_local_path(path) {
-        return local.cloned().unwrap_or(Value::Null);
+        // Omit the key when this machine has no value, so the app falls back to its default.
+        return local.cloned();
     }
 
     match remote {
@@ -390,10 +426,13 @@ fn merge(remote: &Value, local: Option<&Value>, path: &[String]) -> Value {
                 let mut child = path.to_vec();
                 child.push(key.clone());
                 let local_child = local.and_then(|value| value.get(key));
-                result.insert(key.clone(), merge(item, local_child, &child));
+
+                if let Some(value) = merge(item, local_child, &child) {
+                    result.insert(key.clone(), value);
+                }
             }
 
-            Value::Object(result)
+            Some(Value::Object(result))
         }
         Value::Array(items) => {
             let local_items: Vec<&Value> = local
@@ -401,30 +440,25 @@ fn merge(remote: &Value, local: Option<&Value>, path: &[String]) -> Value {
                 .map(|array| array.iter().collect())
                 .unwrap_or_default();
 
-            Value::Array(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(index, item)| {
-                        merge(item, local_items.get(index).copied(), path)
-                    })
-                    .collect(),
-            )
+            let merged = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| merge(item, local_items.get(index).copied(), path))
+                .collect();
+
+            Some(Value::Array(merged))
         }
-        Value::String(value) if value == SENTINEL => match local {
+        Value::String(value) if value == SENTINEL => Some(match local {
             Some(value) if !value.is_object() && !value.is_array() => value.clone(),
             _ => Value::Null,
-        },
-        _ => remote.clone(),
+        }),
+        _ => Some(remote.clone()),
     }
 }
 
 fn copy_local_secrets(value: &Value, path: &[String], merged: &mut Value) {
-    let is_local = is_local_path(path)
-        || path
-            .last()
-            .map(|key| is_secret_key(key))
-            .unwrap_or(false);
+    let is_local =
+        is_local_path(path) || path.last().map(|key| is_secret_key(key)).unwrap_or(false);
 
     if is_local {
         // Keep the match instead of is_none_or so the crate still builds on Rust 1.70.
@@ -491,7 +525,8 @@ fn collect_differences(left: &Value, right: &Value, path: &[String], result: &mu
 fn read_settings(path: &Path) -> Result<Value> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("Hex settings.json not found at: {}", path.display()))?;
-    let value: Value = serde_json::from_str(&contents).context("settings.json is not valid JSON")?;
+    let value: Value =
+        serde_json::from_str(&contents).context("settings.json is not valid JSON")?;
 
     if !value.is_object() {
         bail!("settings.json must contain a JSON object");
@@ -690,10 +725,7 @@ fn history_entry(action: &str) -> Value {
     entry.insert("at".to_string(), Value::String(format_timestamp()));
     entry.insert("machine".to_string(), Value::String(machine_name()));
     entry.insert("user".to_string(), Value::String(user_name()));
-    entry.insert(
-        "os".to_string(),
-        Value::String(env::consts::OS.to_string()),
-    );
+    entry.insert("os".to_string(), Value::String(env::consts::OS.to_string()));
     entry.insert("action".to_string(), Value::String(action.to_string()));
     Value::Object(entry)
 }
@@ -726,7 +758,10 @@ fn extract_history(document: &Value) -> Vec<Value> {
 
 fn build_document(settings: &Value, history: &[Value]) -> Value {
     let mut signature = Map::new();
-    signature.insert("tool".to_string(), Value::String("hex-gist-sync".to_string()));
+    signature.insert(
+        "tool".to_string(),
+        Value::String("hex-gist-sync".to_string()),
+    );
     signature.insert("version".to_string(), Value::from(1));
     signature.insert("history".to_string(), Value::Array(history.to_vec()));
 
@@ -877,7 +912,8 @@ fn pull_from_gist(options: &Options, id: &str) -> Result<Option<PathBuf>> {
         None
     };
 
-    let mut merged = merge(&remote, local.as_ref(), &[]);
+    let mut merged =
+        merge(&remote, local.as_ref(), &[]).unwrap_or_else(|| Value::Object(Map::new()));
     let mut backup_path = None;
 
     if let Some(local_value) = &local {
@@ -1035,7 +1071,9 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
 
         if local_changed && remote_changed {
             if !conflict_reported {
-                eprintln!("[watch] Conflict: settings and gist both changed. Run push or pull manually.");
+                eprintln!(
+                    "[watch] Conflict: settings and gist both changed. Run push or pull manually."
+                );
                 conflict_reported = true;
             }
             continue;
@@ -1143,7 +1181,9 @@ fn install_service() -> Result<()> {
         .context("Could not run systemctl")?;
 
     if enabled.success() {
-        println!("Service enabled and started. Check with: systemctl --user status {SYSTEMD_SERVICE}");
+        println!(
+            "Service enabled and started. Check with: systemctl --user status {SYSTEMD_SERVICE}"
+        );
     } else {
         println!("Enable it with: systemctl --user enable --now {SYSTEMD_SERVICE}");
     }

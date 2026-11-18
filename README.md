@@ -1,5 +1,6 @@
 # Hex Gist Sync
 
+[![CI and release](https://github.com/callmeteus/hex-sync/actions/workflows/release.yml/badge.svg)](https://github.com/callmeteus/hex-sync/actions/workflows/release.yml)
 [![Rust 1.70+](https://img.shields.io/badge/rust-1.70%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue.svg)](https://github.com/callmeteus/hex-sync)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -47,13 +48,13 @@ This tool syncs the settings you actually want to share and leaves everything el
 
 ```mermaid
 flowchart TD
-    L[Local settings.json] --> S[Sanitize secrets and machine paths]
+    L[Local settings.json] --> S[Sanitize secrets, hotkeys, audio input and model]
     S --> G[(Secret gist on GitHub)]
     G --> M[Merge with values already on this machine]
     M --> R[Updated settings.json]
 ```
 
-Values that must stay local are replaced with the sentinel `__HEX_SYNC_LOCAL__` before upload. On `pull`, each sentinel is replaced with the value already present in the local file. On a fresh machine, those values become `null` and Hex falls back to its own defaults.
+Values that must stay local are replaced with the sentinel `__HEX_SYNC_LOCAL__` before upload. On `pull`, each sentinel is replaced with the value already present in the local file. On a fresh machine, the key is omitted so Hex uses its own default.
 
 Runtime files such as `history.json`, `local-api.json`, `session.env` and token files are never read or uploaded. Only `settings.json` is involved.
 
@@ -63,6 +64,10 @@ Runtime files such as `history.json`, `local-api.json`, `session.env` and token 
 - Rust 1.70 or newer to build from source.
 
 ## Installation
+
+Prebuilt binaries for Linux and Windows are attached to every [GitHub release](https://github.com/callmeteus/hex-sync/releases). Download the one for your platform and put it on your `PATH`.
+
+To build from source:
 
 ```bash
 git clone https://github.com/callmeteus/hex-sync.git
@@ -199,12 +204,17 @@ Gists created by older versions contain plain settings and still work. The first
 | Setting | Reason |
 | --- | --- |
 | Keys matching `apiKey`, `token`, `secret`, `password`, `credential`, `auth` | Credentials must never leave the machine. |
-| `microphone` | Capture device names are hardware-specific. |
+| `microphone`, `avoid_bluetooth_microphone`, `transcription_device` | Audio input is tied to the hardware on this machine. |
+| `transcription.model`, `transcription_recents`, `capture.transcriber`, `keyboard_model_switching` | The input model is a local choice, not a shared preference. |
+| `experimental.hex_microphone*` | Virtual microphone behavior depends on the local setup. |
+| All `*_hotkey` fields, `shortcut_mode`, `double_tap_*`, `gnome_keyboard_shortcuts`, `share_dictation_shortcut` | Keybinds are configured per machine. |
 | `meetings.output_folder`, `capture.folder`, `screenshots.folder` | Absolute paths differ between machines and users. |
 | `capture.routing.jev`, `jevApiKey`, `agentHost`, `agentOpencode` | Integration endpoints and their credentials. |
 | `migrations` | Internal application bookkeeping. |
 
-A credential added locally after the last `push` is also preserved during a later `pull`.
+Everything else is merged. Vocabulary boosts, dictation modes, replacements, transformations and post-processing prompts are shared, while the keys above are read from the local file on every `pull`. A credential added locally after the last `push` is also preserved later.
+
+If a machine has no local value for a machine-only field, `pull` omits that key instead of writing `null`, so Hex uses its own default.
 
 ## Configuration
 
