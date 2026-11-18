@@ -1,10 +1,10 @@
-# HEx Gist Sync
+# Hex Gist Sync
 
-CLI em Rust para deixar as configurações do HEx portáteis usando um gist do GitHub como "nuvem". Funciona no Linux e no Windows, então dá para usar a mesma configuração nos dois sistemas.
+CLI em Rust para deixar as configurações do Hex portáteis usando um gist do GitHub como "nuvem". Funciona no Linux e no Windows, então dá para usar a mesma configuração nos dois sistemas.
 
 A CLI fala inglês. A documentação abaixo está em português.
 
-**Sincroniza apenas** o arquivo `settings.json` do HEx, onde ficam atalhos, idioma, modelos de transcrição, modos de ditado e regras de roteamento. Nada de estado local é enviado: histórico de ditados, token da API local, variáveis de sessão e arquivos de token nunca saem da máquina.
+**Sincroniza apenas** o arquivo `settings.json` do Hex, onde ficam atalhos, idioma, modelos de transcrição, modos de ditado e regras de roteamento. Nada de estado local é enviado: histórico de ditados, token da API local, variáveis de sessão e arquivos de token nunca saem da máquina.
 
 ## Como cada sistema encontra o settings.json
 
@@ -72,21 +72,21 @@ HEX_GIST_ID=<id-do-gist> hex-gist-sync pull
 ## Uso diário
 
 ```bash
-hex-gist-sync push   # depois de mudar algo nas configurações do HEx
+hex-gist-sync push   # depois de mudar algo nas configurações do Hex
 hex-gist-sync pull   # na outra máquina, para trazer as mudanças
 hex-gist-sync diff   # compara o arquivo local com o gist, sem alterar nada
 ```
 
 O `diff` lista os caminhos que divergiram. Se ele mostrar diferença, escolha `push` ou `pull` explicitamente: o script nunca decide a direção sozinho.
 
-O `pull` salva um backup com timestamp ao lado do `settings.json` antes de substituir o arquivo. Feche o HEx antes de puxar e abra de novo depois, senão o app pode sobrescrever a alteração com o estado que está na memória. Isso vale tanto no Linux quanto no Windows.
+O `pull` salva um backup com timestamp ao lado do `settings.json` antes de substituir o arquivo. Feche o Hex antes de puxar e abra de novo depois, senão o app pode sobrescrever a alteração com o estado que está na memória. Isso vale tanto no Linux quanto no Windows.
 
 ## Variáveis de ambiente
 
 | Variável | Finalidade |
 | --- | --- |
 | `HEX_GIST_ID` | ID do gist, tem precedência sobre o arquivo de estado |
-| `HEX_SETTINGS_PATH` | Caminho do `settings.json` do HEx |
+| `HEX_SETTINGS_PATH` | Caminho do `settings.json` do Hex |
 | `HEX_GIST_FILE` | Nome do arquivo dentro do gist, padrão `hex-settings.json` |
 | `HEX_GIST_STATE_FILE` | Onde o ID do gist é salvo |
 | `HEX_GIST_PUBLIC` | Use `1` no `init` para criar gist público |

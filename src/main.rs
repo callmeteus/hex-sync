@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
-const GIST_DESCRIPTION: &str = "HEx settings (hex-gist-sync)";
+const GIST_DESCRIPTION: &str = "Hex settings (hex-gist-sync)";
 const SENTINEL: &str = "__HEX_SYNC_LOCAL__";
 
 // Values that belong to one machine only. Their whole subtree is replaced by a sentinel.
@@ -80,7 +80,7 @@ fn print_help() {
          \n\
          Environment variables:\n\
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
-           HEX_SETTINGS_PATH    Path to the HEx settings.json.\n\
+           HEX_SETTINGS_PATH    Path to the Hex settings.json.\n\
            HEX_GIST_FILE        Name of the file inside the gist.\n\
            HEX_GIST_STATE_FILE  Where the gist ID is stored.\n\
            HEX_GIST_PUBLIC      Set to 1 with init to create a public gist."
@@ -170,7 +170,7 @@ fn detect_settings_path() -> PathBuf {
 
     #[cfg(windows)]
     {
-        // HEx has no published Windows data path, so check both AppData roots and both names.
+        // Hex has no published Windows data path, so check both AppData roots and both names.
         for variable in ["APPDATA", "LOCALAPPDATA"] {
             if let Some(directory) = env::var_os(variable) {
                 let base = PathBuf::from(directory);
@@ -422,7 +422,7 @@ fn collect_differences(left: &Value, right: &Value, path: &[String], result: &mu
 
 fn read_settings(path: &Path) -> Result<Value> {
     let contents = fs::read_to_string(path)
-        .with_context(|| format!("HEx settings.json not found at: {}", path.display()))?;
+        .with_context(|| format!("Hex settings.json not found at: {}", path.display()))?;
     let value: Value = serde_json::from_str(&contents).context("settings.json is not valid JSON")?;
 
     if !value.is_object() {
@@ -680,7 +680,7 @@ fn cmd_pull(options: &Options) -> Result<()> {
     write_settings(&options.settings_path, &merged)?;
 
     println!("Settings downloaded from gist {id}.");
-    println!("Restart HEx if it is running, so it reloads the settings.");
+    println!("Restart Hex if it is running, so it reloads the settings.");
 
     Ok(())
 }
