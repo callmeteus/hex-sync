@@ -6,7 +6,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
 const GIST_DESCRIPTION: &str = "Hex settings (hex-gist-sync)";
@@ -32,6 +33,9 @@ enum CommandKind {
     Push,
     Pull,
     Diff,
+    Watch { interval: u64 },
+    InstallService,
+    UninstallService,
     Help,
 }
 
@@ -63,6 +67,9 @@ fn run() -> Result<()> {
         CommandKind::Push => cmd_push(&options),
         CommandKind::Pull => cmd_pull(&options),
         CommandKind::Diff => cmd_diff(&options),
+        CommandKind::Watch { interval } => cmd_watch(&options, *interval),
+        CommandKind::InstallService => install_service(),
+        CommandKind::UninstallService => uninstall_service(),
     }
 }
 
@@ -76,14 +83,21 @@ fn print_help() {
            push             Upload local settings to the gist.\n\
            pull             Download settings from the gist, preserving local secrets.\n\
            diff             Show whether the local file and the gist diverged.\n\
-           help             Show this help.\n\
+           watch             Run a daemon that syncs changes automatically.\n\
+           install-service   Install the daemon as a systemd user service or scheduled task.\n\
+           uninstall-service Remove the automatic sync service.\n\
+           help              Show this help.\n\
+         \n\
+         Watch options:\n\
+           --interval <seconds>  Poll interval, default 15 (or HEX_SYNC_INTERVAL).\n\
          \n\
          Environment variables:\n\
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
            HEX_SETTINGS_PATH    Path to the Hex settings.json.\n\
            HEX_GIST_FILE        Name of the file inside the gist.\n\
            HEX_GIST_STATE_FILE  Where the gist ID is stored.\n\
-           HEX_GIST_PUBLIC      Set to 1 with init to create a public gist."
+           HEX_GIST_PUBLIC      Set to 1 with init to create a public gist.\n\
+           HEX_SYNC_INTERVAL    Default watch interval in seconds."
     );
 }
 
@@ -119,6 +133,36 @@ fn parse_args() -> Result<Options> {
         Some("push") => CommandKind::Push,
         Some("pull") => CommandKind::Pull,
         Some("diff") => CommandKind::Diff,
+        Some("watch") => {
+            let mut interval = env::var("HEX_SYNC_INTERVAL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(15);
+
+            let mut index = 1;
+            while index < args.len() {
+                if args[index] == "--interval" || args[index] == "-i" {
+                    let value = args
+                        .get(index + 1)
+                        .context("Missing value for --interval")?;
+                    interval = value.parse().context("Interval must be a number of seconds")?;
+                    index += 2;
+                } else if let Some(value) = args[index].strip_prefix("--interval=") {
+                    interval = value.parse().context("Interval must be a number of seconds")?;
+                    index += 1;
+                } else {
+                    bail!("Unknown watch option: {}", args[index]);
+                }
+            }
+
+            if interval == 0 {
+                bail!("Interval must be at least 1 second");
+            }
+
+            CommandKind::Watch { interval }
+        }
+        Some("install-service") => CommandKind::InstallService,
+        Some("uninstall-service") => CommandKind::UninstallService,
         Some("help") | Some("--help") | Some("-h") | None => CommandKind::Help,
         Some(other) => bail!("Unknown command: {other}"),
     };
@@ -563,7 +607,7 @@ fn write_settings(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
+fn fetch_remote_raw(options: &Options, id: &str) -> Result<String> {
     let raw = run_gh(
         &[
             "gist",
@@ -576,6 +620,11 @@ fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
         None,
     )?;
 
+    Ok(raw.trim_end().to_string())
+}
+
+fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
+    let raw = fetch_remote_raw(options, id)?;
     let value: Value = serde_json::from_str(&raw).context("The gist file is not valid JSON")?;
 
     if !value.is_object() {
@@ -631,8 +680,13 @@ fn cmd_use(options: &Options, value: &str) -> Result<()> {
 
 fn cmd_push(options: &Options) -> Result<()> {
     require_auth()?;
-
     let id = resolve_gist_id(options)?;
+    push_to_gist(options, &id)?;
+    println!("Settings uploaded to gist {id}.");
+    Ok(())
+}
+
+fn push_to_gist(options: &Options, id: &str) -> Result<()> {
     let settings = read_settings(&options.settings_path)?;
     let sanitized = to_json_string(&sanitize(&settings, &[]))?;
     let temporary = TempFile::new(&sanitized)?;
@@ -642,7 +696,7 @@ fn cmd_push(options: &Options) -> Result<()> {
         &[
             "gist",
             "edit",
-            &id,
+            id,
             "--filename",
             &options.gist_filename,
             &path,
@@ -650,15 +704,26 @@ fn cmd_push(options: &Options) -> Result<()> {
         None,
     )?;
 
-    println!("Settings uploaded to gist {id}.");
     Ok(())
 }
 
 fn cmd_pull(options: &Options) -> Result<()> {
     require_auth()?;
-
     let id = resolve_gist_id(options)?;
-    let remote = fetch_remote(options, &id)?;
+    let backup = pull_from_gist(options, &id)?;
+
+    if let Some(path) = backup {
+        println!("Backup saved to: {}", path.display());
+    }
+
+    println!("Settings downloaded from gist {id}.");
+    println!("Restart Hex if it is running, so it reloads the settings.");
+
+    Ok(())
+}
+
+fn pull_from_gist(options: &Options, id: &str) -> Result<Option<PathBuf>> {
+    let remote = fetch_remote(options, id)?;
     let local = if options.settings_path.is_file() {
         Some(read_settings(&options.settings_path)?)
     } else {
@@ -666,6 +731,7 @@ fn cmd_pull(options: &Options) -> Result<()> {
     };
 
     let mut merged = merge(&remote, local.as_ref(), &[]);
+    let mut backup_path = None;
 
     if let Some(local_value) = &local {
         copy_local_secrets(local_value, &[], &mut merged);
@@ -674,15 +740,12 @@ fn cmd_pull(options: &Options) -> Result<()> {
             .settings_path
             .with_extension(format!("bak.{}", timestamp_secs()));
         fs::copy(&options.settings_path, &backup)?;
-        println!("Backup saved to: {}", backup.display());
+        backup_path = Some(backup);
     }
 
     write_settings(&options.settings_path, &merged)?;
 
-    println!("Settings downloaded from gist {id}.");
-    println!("Restart Hex if it is running, so it reloads the settings.");
-
-    Ok(())
+    Ok(backup_path)
 }
 
 fn cmd_diff(options: &Options) -> Result<()> {
@@ -706,4 +769,251 @@ fn cmd_diff(options: &Options) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const SYSTEMD_SERVICE: &str = "hex-gist-sync.service";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_TASK: &str = "HexGistSync";
+
+fn local_snapshot(options: &Options) -> Result<String> {
+    let settings = read_settings(&options.settings_path)?;
+    Ok(to_json_string(&sanitize(&settings, &[]))?
+        .trim_end()
+        .to_string())
+}
+
+fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
+    require_auth()?;
+
+    let id = resolve_gist_id(options)?;
+
+    if !options.settings_path.is_file() {
+        println!("[watch] No local settings found, pulling from gist {id}.");
+        pull_from_gist(options, &id)?;
+    }
+
+    let mut local_baseline = local_snapshot(options)?;
+    let mut remote_baseline = fetch_remote_raw(options, &id)?;
+    let mut conflict_reported = false;
+
+    println!("[watch] Watching every {interval}s. Press Ctrl+C to stop.");
+
+    loop {
+        sleep(Duration::from_secs(interval));
+
+        let local = match local_snapshot(options) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[watch] Could not read local settings: {error:#}");
+                continue;
+            }
+        };
+
+        let remote = match fetch_remote_raw(options, &id) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[watch] Could not read gist: {error:#}");
+                continue;
+            }
+        };
+
+        let local_changed = local != local_baseline;
+        let remote_changed = remote != remote_baseline;
+
+        if !local_changed && !remote_changed {
+            conflict_reported = false;
+            continue;
+        }
+
+        if local_changed && remote_changed {
+            if !conflict_reported {
+                eprintln!("[watch] Conflict: settings and gist both changed. Run push or pull manually.");
+                conflict_reported = true;
+            }
+            continue;
+        }
+
+        if local_changed {
+            match push_to_gist(options, &id) {
+                Ok(()) => {
+                    println!("[watch] Pushed local changes to gist {id}.");
+                    local_baseline = local;
+                    remote_baseline = local_baseline.clone();
+                    conflict_reported = false;
+                }
+                Err(error) => eprintln!("[watch] Push failed: {error:#}"),
+            }
+        } else {
+            match pull_from_gist(options, &id) {
+                Ok(_) => {
+                    println!("[watch] Pulled gist changes into local settings.");
+                    remote_baseline = remote;
+                    local_baseline = match local_snapshot(options) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("[watch] Could not re-read local settings: {error:#}");
+                            continue;
+                        }
+                    };
+                    conflict_reported = false;
+                }
+                Err(error) => eprintln!("[watch] Pull failed: {error:#}"),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn environment_lines() -> Vec<String> {
+    [
+        "HEX_GIST_ID",
+        "HEX_SETTINGS_PATH",
+        "HEX_GIST_FILE",
+        "HEX_GIST_STATE_FILE",
+        "HEX_GIST_PUBLIC",
+        "HEX_SYNC_INTERVAL",
+    ]
+    .iter()
+    .filter_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| format!("Environment={name}={value}"))
+    })
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn service_file_path() -> Result<PathBuf> {
+    let directory = dirs::config_dir()
+        .context("Could not find the user config directory")?
+        .join("systemd/user");
+
+    Ok(directory.join(SYSTEMD_SERVICE))
+}
+
+#[cfg(target_os = "linux")]
+fn install_service() -> Result<()> {
+    let executable = env::current_exe()?.canonicalize()?;
+    let path = service_file_path()?;
+    fs::create_dir_all(path.parent().context("Service path has no parent")?)?;
+
+    let mut content = format!(
+        "[Unit]\nDescription=Hex Gist Sync daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" watch\nRestart=always\nRestartSec=5\n",
+        executable.display()
+    );
+
+    for line in environment_lines() {
+        content.push_str(&line);
+        content.push('\n');
+    }
+
+    content.push_str("\n[Install]\nWantedBy=default.target\n");
+    fs::write(&path, content)?;
+
+    println!("Service file written to: {}", path.display());
+
+    let reloaded = Command::new("systemctl")
+        .arg("--user")
+        .arg("daemon-reload")
+        .status();
+
+    if !matches!(reloaded, Ok(status) if status.success()) {
+        println!("Start the service with: systemctl --user daemon-reload");
+        return Ok(());
+    }
+
+    let enabled = Command::new("systemctl")
+        .arg("--user")
+        .args(["enable", "--now", SYSTEMD_SERVICE])
+        .status()
+        .context("Could not run systemctl")?;
+
+    if enabled.success() {
+        println!("Service enabled and started. Check with: systemctl --user status {SYSTEMD_SERVICE}");
+    } else {
+        println!("Enable it with: systemctl --user enable --now {SYSTEMD_SERVICE}");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_service() -> Result<()> {
+    let path = service_file_path()?;
+
+    if !path.is_file() {
+        bail!("Service file not found: {}", path.display());
+    }
+
+    let _ = Command::new("systemctl")
+        .arg("--user")
+        .args(["disable", "--now", SYSTEMD_SERVICE])
+        .status();
+
+    fs::remove_file(&path)?;
+    println!("Service file removed: {}", path.display());
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_service() -> Result<()> {
+    let executable = env::current_exe()?.canonicalize()?;
+    let command = format!("\"{}\" watch", executable.display());
+
+    let created = Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            WINDOWS_TASK,
+            "/TR",
+            &command,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+            "/F",
+        ])
+        .status()
+        .context("Could not run schtasks")?;
+
+    if !created.success() {
+        bail!("schtasks failed to create the task");
+    }
+
+    let _ = Command::new("schtasks")
+        .args(["/Run", "/TN", WINDOWS_TASK])
+        .status();
+
+    println!("Task '{WINDOWS_TASK}' created and started. It runs on every logon.");
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_service() -> Result<()> {
+    let deleted = Command::new("schtasks")
+        .args(["/Delete", "/TN", WINDOWS_TASK, "/F"])
+        .status()
+        .context("Could not run schtasks")?;
+
+    if !deleted.success() {
+        bail!("schtasks failed to delete the task");
+    }
+
+    println!("Task '{WINDOWS_TASK}' removed.");
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn install_service() -> Result<()> {
+    bail!("Automatic service installation is supported only on Linux and Windows")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn uninstall_service() -> Result<()> {
+    bail!("Automatic service installation is supported only on Linux and Windows")
 }

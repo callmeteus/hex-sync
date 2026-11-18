@@ -17,6 +17,7 @@ Hex Gist Sync is a small Rust CLI that keeps the portable parts of Hex's `settin
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Commands](#commands)
+- [Automatic sync](#automatic-sync)
 - [What stays local](#what-stays-local)
 - [Configuration](#configuration)
 - [Platform details](#platform-details)
@@ -33,6 +34,7 @@ This tool syncs the settings you actually want to share and leaves everything el
 ## Features
 
 - Bidirectional sync through a GitHub gist: `push`, `pull` and a read-only `diff`.
+- An optional daemon that watches both sides and syncs changes automatically.
 - Works on Linux and Windows with the same commands and the same gist.
 - Secret gist by default, with an opt-in `--public` flag.
 - Credentials and machine-specific fields are replaced before upload and restored on download.
@@ -111,9 +113,40 @@ HEX_GIST_ID=0123456789abcdef0123456789abcdef hex-gist-sync pull
 | `push` | Upload sanitized local settings to the gist. |
 | `pull` | Download settings and merge local values back into them. |
 | `diff` | List the paths that differ between the local file and the gist. |
+| `watch [--interval <seconds>]` | Run the sync daemon in the foreground. |
+| `install-service` | Install the daemon as a systemd user service or a scheduled task. |
+| `uninstall-service` | Remove the automatic sync service. |
 | `help` | Print usage and environment variables. |
 
-The tool never picks a sync direction for you. If `diff` reports a difference, choose `push` or `pull` explicitly.
+The tool never picks a sync direction for you in `push`, `pull` or `diff`. If `diff` reports a difference, choose `push` or `pull` explicitly.
+
+## Automatic sync
+
+`watch` polls the local `settings.json` and the gist, then reacts to the side that changed:
+
+```bash
+hex-gist-sync watch
+hex-gist-sync watch --interval 30
+```
+
+The default interval is 15 seconds and can also be set with `HEX_SYNC_INTERVAL`. Press Ctrl+C to stop the foreground process.
+
+Only changes to portable settings trigger a sync. Editing a local credential or microphone changes nothing in the gist, because those values are sanitized away before comparison. If both sides change before the daemon notices, it reports a conflict and waits for you to resolve it with `push` or `pull`. It never overwrites one side with the other automatically.
+
+To run it at login instead of keeping a terminal open:
+
+```bash
+# Linux: creates ~/.config/systemd/user/hex-gist-sync.service, enables and starts it
+hex-gist-sync install-service
+systemctl --user status hex-gist-sync.service
+
+# Windows: creates a "HexGistSync" task that runs on logon and starts it now
+hex-gist-sync install-service
+```
+
+Remove it with `hex-gist-sync uninstall-service`. On Linux this disables and deletes the service file; on Windows it deletes the scheduled task.
+
+The service inherits the gist ID from the local state file. If you rely on `HEX_GIST_*` environment variables instead, run `install-service` from a shell where those variables are set so they can be written into the service definition. Authentication comes from the GitHub CLI config, so no token is stored in the service file.
 
 ## What stays local
 
@@ -136,6 +169,7 @@ A credential added locally after the last `push` is also preserved during a late
 | `HEX_GIST_FILE` | Filename inside the gist, default `hex-settings.json`. |
 | `HEX_GIST_STATE_FILE` | Where the gist ID is stored. |
 | `HEX_GIST_PUBLIC` | Set to `1` with `init` to create a public gist. |
+| `HEX_SYNC_INTERVAL` | Default `watch` interval in seconds, default 15. |
 
 ## Platform details
 
