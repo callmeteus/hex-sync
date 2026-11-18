@@ -1,96 +1,169 @@
 # Hex Gist Sync
 
-CLI em Rust para deixar as configurações do Hex portáteis usando um gist do GitHub como "nuvem". Funciona no Linux e no Windows, então dá para usar a mesma configuração nos dois sistemas.
+[![Rust 1.70+](https://img.shields.io/badge/rust-1.70%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-blue.svg)](https://github.com/callmeteus/hex-sync)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A CLI fala inglês. A documentação abaixo está em português.
+> One secret gist. The same Hex setup on Linux and Windows.
 
-**Sincroniza apenas** o arquivo `settings.json` do Hex, onde ficam atalhos, idioma, modelos de transcrição, modos de ditado e regras de roteamento. Nada de estado local é enviado: histórico de ditados, token da API local, variáveis de sessão e arquivos de token nunca saem da máquina.
+Hex Gist Sync is a small Rust CLI that keeps the portable parts of Hex's `settings.json` in a GitHub gist. Push after you change a shortcut or a transcription mode, pull on the other machine, and keep working. Credentials, capture devices, file paths and local state stay on each machine.
 
-## Como cada sistema encontra o settings.json
+## Contents
 
-- Linux: `$XDG_DATA_HOME/hex/settings.json` ou `~/.local/share/hex/settings.json`.
-- Windows: procura `hex/settings.json` e `anomaly/hex/settings.json` dentro de `%APPDATA%` e `%LOCALAPPDATA%`.
+- [Why](#why)
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [What stays local](#what-stays-local)
+- [Configuration](#configuration)
+- [Platform details](#platform-details)
+- [Security](#security)
+- [Project layout](#project-layout)
+- [License](#license)
 
-O primeiro arquivo existente é usado. Se você usar outro caminho, defina `HEX_SETTINGS_PATH` ou configure o seu binário com esse ambiente. O ID do gist fica em `~/.config/hex-gist-sync/gist-id` no Linux e em `%APPDATA%\hex-gist-sync\gist-id` no Windows, com override por `HEX_GIST_STATE_FILE`.
+## Why
 
-## O que não vai para o gist
+Hex stores its configuration in a single `settings.json`. Copying that file between machines is tempting, but it also carries API keys, the selected microphone, absolute folder paths and app bookkeeping. Those values are machine-specific and some of them are secrets.
 
-Antes do upload, os valores abaixo são trocados por `__HEX_SYNC_LOCAL__`. No `pull`, eles são restaurados do `settings.json` da própria máquina:
+This tool syncs the settings you actually want to share and leaves everything else where it belongs.
 
-- chaves e segredos, detectados por nome (`apiKey`, `token`, `secret`, `password`, `credential`, `auth`);
-- `microphone`, que é o dispositivo de captura escolhido nesta máquina;
-- pastas locais: `meetings.output_folder`, `capture.folder` e `screenshots.folder`;
-- campos de integração: `capture.routing.jev`, `jevApiKey`, `agentHost` e `agentOpencode`;
-- `migrations`, que é controle interno do app.
+## Features
 
-Se você adicionou uma chave nova localmente depois do último `push`, o `pull` também preserva esse valor.
+- Bidirectional sync through a GitHub gist: `push`, `pull` and a read-only `diff`.
+- Works on Linux and Windows with the same commands and the same gist.
+- Secret gist by default, with an opt-in `--public` flag.
+- Credentials and machine-specific fields are replaced before upload and restored on download.
+- Timestamped backup of `settings.json` before every `pull`.
+- No runtime dependencies beyond the GitHub CLI. No Python, bash or jq required.
 
-## Requisitos
+## How it works
 
-- GitHub CLI autenticado (`gh auth login`). Funciona com `GH_TOKEN` ou `GITHUB_TOKEN` no ambiente.
-- Rust 1.70 ou superior para compilar. Não precisa de Python, bash, jq nem cmake em tempo de execução.
-
-## Build e instalação
-
-```bash
-git clone <url-do-seu-repo> hex-gist-sync
-cd hex-gist-sync
-cargo build --release
+```mermaid
+flowchart TD
+    L[Local settings.json] --> S[Sanitize secrets and machine paths]
+    S --> G[(Secret gist on GitHub)]
+    G --> M[Merge with values already on this machine]
+    M --> R[Updated settings.json]
 ```
 
-O binário fica em `target/release/hex-gist-sync` (`.exe` no Windows). Para instalar no PATH:
+Values that must stay local are replaced with the sentinel `__HEX_SYNC_LOCAL__` before upload. On `pull`, each sentinel is replaced with the value already present in the local file. On a fresh machine, those values become `null` and Hex falls back to its own defaults.
+
+Runtime files such as `history.json`, `local-api.json`, `session.env` and token files are never read or uploaded. Only `settings.json` is involved.
+
+## Prerequisites
+
+- [GitHub CLI](https://cli.github.com/) installed and authenticated with `gh auth login`. `GH_TOKEN` and `GITHUB_TOKEN` also work.
+- Rust 1.70 or newer to build from source.
+
+## Installation
 
 ```bash
+git clone https://github.com/callmeteus/hex-sync.git
+cd hex-sync
 cargo install --path .
 ```
 
-No Windows, o mesmo comando funciona dentro do PowerShell ou do terminal Git Bash desde que o `cargo` esteja no PATH.
+To build without installing into `~/.cargo/bin`:
 
-## Fluxo entre duas máquinas
+```bash
+cargo build --release
+```
 
-Na primeira máquina:
+The binary is written to `target/release/hex-gist-sync`, or `hex-gist-sync.exe` on Windows. The `cargo install --path .` command works the same way in PowerShell and Git Bash, as long as `cargo` is on your `PATH`.
+
+## Quick start
+
+On the first machine:
 
 ```bash
 hex-gist-sync init
 ```
 
-Por padrão o gist é secreto, ou seja, não aparece na listagem pública, mas continua acessível por URL. Para criar público, use `hex-gist-sync init --public`. O comando imprime a URL do gist e salva o ID localmente.
+```text
+Gist ID saved to: /home/you/.config/hex-gist-sync/gist-id
+Gist created: https://gist.github.com/you/0123456789abcdef0123456789abcdef
+```
 
-Na segunda máquina:
+The gist is secret by default, so it is not publicly listed but remains accessible by URL. Use `hex-gist-sync init --public` if you really want it listed.
+
+On the second machine:
 
 ```bash
-hex-gist-sync use <id-ou-url-do-gist>
+hex-gist-sync use https://gist.github.com/you/0123456789abcdef0123456789abcdef
 hex-gist-sync pull
 ```
 
-Ou, sem salvar estado:
+You can also skip storing the gist ID:
 
 ```bash
-HEX_GIST_ID=<id-do-gist> hex-gist-sync pull
+HEX_GIST_ID=0123456789abcdef0123456789abcdef hex-gist-sync pull
 ```
 
-## Uso diário
+## Commands
 
-```bash
-hex-gist-sync push   # depois de mudar algo nas configurações do Hex
-hex-gist-sync pull   # na outra máquina, para trazer as mudanças
-hex-gist-sync diff   # compara o arquivo local com o gist, sem alterar nada
-```
-
-O `diff` lista os caminhos que divergiram. Se ele mostrar diferença, escolha `push` ou `pull` explicitamente: o script nunca decide a direção sozinho.
-
-O `pull` salva um backup com timestamp ao lado do `settings.json` antes de substituir o arquivo. Feche o Hex antes de puxar e abra de novo depois, senão o app pode sobrescrever a alteração com o estado que está na memória. Isso vale tanto no Linux quanto no Windows.
-
-## Variáveis de ambiente
-
-| Variável | Finalidade |
+| Command | Description |
 | --- | --- |
-| `HEX_GIST_ID` | ID do gist, tem precedência sobre o arquivo de estado |
-| `HEX_SETTINGS_PATH` | Caminho do `settings.json` do Hex |
-| `HEX_GIST_FILE` | Nome do arquivo dentro do gist, padrão `hex-settings.json` |
-| `HEX_GIST_STATE_FILE` | Onde o ID do gist é salvo |
-| `HEX_GIST_PUBLIC` | Use `1` no `init` para criar gist público |
+| `init [--public]` | Create a gist from the current settings and save its ID locally. |
+| `use <id\|url>` | Point this machine to an existing gist. |
+| `push` | Upload sanitized local settings to the gist. |
+| `pull` | Download settings and merge local values back into them. |
+| `diff` | List the paths that differ between the local file and the gist. |
+| `help` | Print usage and environment variables. |
 
-## Segurança
+The tool never picks a sync direction for you. If `diff` reports a difference, choose `push` or `pull` explicitly.
 
-O gist padrão é secreto. Mesmo assim, revise o conteúdo antes de usar `--public`: modos de pós-processamento podem conter prompts e regras próprias. Se alguma chave chegar a vazar, revogue e gere outra, não conte apenas com a exclusão do gist.
+## What stays local
+
+| Setting | Reason |
+| --- | --- |
+| Keys matching `apiKey`, `token`, `secret`, `password`, `credential`, `auth` | Credentials must never leave the machine. |
+| `microphone` | Capture device names are hardware-specific. |
+| `meetings.output_folder`, `capture.folder`, `screenshots.folder` | Absolute paths differ between machines and users. |
+| `capture.routing.jev`, `jevApiKey`, `agentHost`, `agentOpencode` | Integration endpoints and their credentials. |
+| `migrations` | Internal application bookkeeping. |
+
+A credential added locally after the last `push` is also preserved during a later `pull`.
+
+## Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `HEX_GIST_ID` | Gist ID, takes precedence over the state file. |
+| `HEX_SETTINGS_PATH` | Path to Hex's `settings.json`. |
+| `HEX_GIST_FILE` | Filename inside the gist, default `hex-settings.json`. |
+| `HEX_GIST_STATE_FILE` | Where the gist ID is stored. |
+| `HEX_GIST_PUBLIC` | Set to `1` with `init` to create a public gist. |
+
+## Platform details
+
+| | Linux | Windows |
+| --- | --- | --- |
+| Settings file | `$XDG_DATA_HOME/hex/settings.json` or `~/.local/share/hex/settings.json` | `hex/settings.json` or `anomaly/hex/settings.json` under `%APPDATA%` or `%LOCALAPPDATA%` |
+| Gist ID | `~/.config/hex-gist-sync/gist-id` | `%APPDATA%\hex-gist-sync\gist-id` |
+| Binary | `hex-gist-sync` | `hex-gist-sync.exe` |
+
+The first existing settings file wins. If Hex stores its configuration somewhere else on your system, set `HEX_SETTINGS_PATH`.
+
+Close Hex before running `pull` and reopen it afterwards. Otherwise the app may overwrite the new file with the state it still holds in memory. The same applies on both platforms.
+
+## Security
+
+Gists are secret by default. Review the gist contents before using `--public`, since post-processing modes can contain custom prompts and routing rules. If a credential ever leaks, revoke and regenerate it; deleting the gist is not enough.
+
+## Project layout
+
+```text
+hex-sync/
+├── Cargo.toml
+├── Cargo.lock
+├── README.md
+└── src/
+    └── main.rs
+```
+
+## License
+
+MIT
