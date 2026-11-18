@@ -10,8 +10,11 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
-const GIST_DESCRIPTION: &str = "Hex settings (hex-gist-sync)";
-const GIST_FORMAT: &str = "hex-gist-sync/v1";
+const SETTINGS_FILENAME: &str = "hs-settings.json";
+const LEGACY_SETTINGS_FILENAME: &str = "settings.json";
+const GIST_DESCRIPTION: &str = "Hex settings (hex-sync)";
+const GIST_FORMAT: &str = "hex-sync/v1";
+const LEGACY_GIST_FORMAT: &str = "hex-gist-sync/v1";
 const HISTORY_LIMIT: usize = 50;
 const REPOSITORY: &str = "callmeteus/hex-sync";
 const STATE_FILENAME: &str = "gist-id";
@@ -113,7 +116,7 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "Usage: hex-gist-sync <command> [options]\n\
+        "Usage: hex-sync <command> [options]\n\
          \n\
          Commands:\n\
            init [--public]  Create a gist with the current settings and save its ID locally.\n\
@@ -139,7 +142,7 @@ fn print_help() {
          \n\
          Environment variables:\n\
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
-           HEX_SETTINGS_PATH    Path to the Hex settings.json.\n\
+           HEX_SETTINGS_PATH    Path to the Hex settings file.\n\
            HEX_GIST_FILE        Name of the file inside the gist.\n\
            HEX_GIST_STATE_FILE  Where the gist ID is stored.\n\
            HEX_GIST_PUBLIC      Set to 1 with init to create a public gist.\n\
@@ -169,7 +172,7 @@ fn parse_args() -> Result<Options> {
         }
         Some("use") => {
             let value = args.get(1).context(
-                "Provide the gist ID or URL. Example: hex-gist-sync use https://gist.github.com/user/<id>",
+                "Provide the gist ID or URL. Example: hex-sync use https://gist.github.com/user/<id>",
             )?;
             CommandKind::Use(value.clone())
         }
@@ -273,19 +276,29 @@ fn parse_args() -> Result<Options> {
     })
 }
 
+fn push_settings_candidates(
+    preferred: &mut Vec<PathBuf>,
+    legacy: &mut Vec<PathBuf>,
+    base: PathBuf,
+) {
+    preferred.push(base.join(SETTINGS_FILENAME));
+    legacy.push(base.join(LEGACY_SETTINGS_FILENAME));
+}
+
 fn detect_settings_path() -> PathBuf {
-    let mut candidates = Vec::new();
+    let mut preferred = Vec::new();
+    let mut legacy = Vec::new();
 
     if let Some(directory) = dirs::data_dir() {
-        candidates.push(directory.join("hex").join("settings.json"));
+        push_settings_candidates(&mut preferred, &mut legacy, directory.join("hex"));
     }
 
     if let Some(directory) = dirs::data_local_dir() {
-        candidates.push(directory.join("hex").join("settings.json"));
+        push_settings_candidates(&mut preferred, &mut legacy, directory.join("hex"));
     }
 
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/share/hex/settings.json"));
+        push_settings_candidates(&mut preferred, &mut legacy, home.join(".local/share/hex"));
     }
 
     #[cfg(windows)]
@@ -294,23 +307,27 @@ fn detect_settings_path() -> PathBuf {
         for variable in ["APPDATA", "LOCALAPPDATA"] {
             if let Some(directory) = env::var_os(variable) {
                 let base = PathBuf::from(directory);
-                candidates.push(base.join("hex").join("settings.json"));
-                candidates.push(base.join("anomaly").join("hex").join("settings.json"));
+                push_settings_candidates(&mut preferred, &mut legacy, base.join("hex"));
+                push_settings_candidates(
+                    &mut preferred,
+                    &mut legacy,
+                    base.join("anomaly").join("hex"),
+                );
             }
         }
     }
 
     let mut seen = BTreeSet::new();
-    for candidate in &candidates {
+    for candidate in preferred.iter().chain(legacy.iter()) {
         if seen.insert(candidate.clone()) && candidate.is_file() {
             return candidate.clone();
         }
     }
 
-    candidates
+    preferred
         .into_iter()
         .next()
-        .unwrap_or_else(|| PathBuf::from("settings.json"))
+        .unwrap_or_else(|| PathBuf::from(SETTINGS_FILENAME))
 }
 
 fn default_state_file(settings_path: &Path) -> PathBuf {
@@ -559,12 +576,12 @@ fn collect_differences(left: &Value, right: &Value, path: &[String], result: &mu
 
 fn read_settings(path: &Path) -> Result<Value> {
     let contents = fs::read_to_string(path)
-        .with_context(|| format!("Hex settings.json not found at: {}", path.display()))?;
+        .with_context(|| format!("Hex settings file not found at: {}", path.display()))?;
     let value: Value =
-        serde_json::from_str(&contents).context("settings.json is not valid JSON")?;
+        serde_json::from_str(&contents).context("settings file is not valid JSON")?;
 
     if !value.is_object() {
-        bail!("settings.json must contain a JSON object");
+        bail!("settings file must contain a JSON object");
     }
 
     Ok(value)
@@ -668,7 +685,7 @@ struct TempFile {
 impl TempFile {
     fn new(contents: &str) -> Result<Self> {
         let path = env::temp_dir().join(format!(
-            "hex-gist-sync-{}-{}.json",
+            "hex-sync-{}-{}.json",
             std::process::id(),
             timestamp_nanos()
         ));
@@ -688,7 +705,7 @@ fn write_settings(path: &Path, value: &Value) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let staging = path.with_extension(format!("hex-gist-sync-{}.tmp", timestamp_nanos()));
+    let staging = path.with_extension(format!("hex-sync-{}.tmp", timestamp_nanos()));
     fs::write(&staging, to_json_string(value)?)?;
 
     #[cfg(unix)]
@@ -766,7 +783,9 @@ fn history_entry(action: &str) -> Value {
 }
 
 fn extract_settings(document: &Value) -> Result<Value> {
-    if document.get("format").and_then(Value::as_str) == Some(GIST_FORMAT) {
+    let format = document.get("format").and_then(Value::as_str);
+
+    if format == Some(GIST_FORMAT) || format == Some(LEGACY_GIST_FORMAT) {
         if let Some(settings) = document.get("settings") {
             if settings.is_object() {
                 return Ok(settings.clone());
@@ -793,10 +812,7 @@ fn extract_history(document: &Value) -> Vec<Value> {
 
 fn build_document(settings: &Value, history: &[Value]) -> Value {
     let mut signature = Map::new();
-    signature.insert(
-        "tool".to_string(),
-        Value::String("hex-gist-sync".to_string()),
-    );
+    signature.insert("tool".to_string(), Value::String("hex-sync".to_string()));
     signature.insert("version".to_string(), Value::from(1));
     signature.insert("history".to_string(), Value::Array(history.to_vec()));
 
@@ -990,10 +1006,10 @@ fn cmd_diff(options: &Options) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const SYSTEMD_SERVICE: &str = "hex-gist-sync.service";
+const SYSTEMD_SERVICE: &str = "hex-sync.service";
 
 #[cfg(target_os = "windows")]
-const WINDOWS_TASK: &str = "HexGistSync";
+const WINDOWS_TASK: &str = "HexSync";
 
 fn local_snapshot(options: &Options) -> Result<String> {
     let settings = read_settings(&options.settings_path)?;
@@ -1010,8 +1026,8 @@ fn remote_snapshot(options: &Options, id: &str) -> Result<String> {
 
 fn release_asset_name() -> Result<String> {
     let asset = match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => "hex-gist-sync-linux-x86_64",
-        ("windows", "x86_64") => "hex-gist-sync-windows-x86_64.exe",
+        ("linux", "x86_64") => "hex-sync-linux-x86_64",
+        ("windows", "x86_64") => "hex-sync-windows-x86_64.exe",
         (os, arch) => bail!("No release binary published for {os} on {arch}"),
     };
 
@@ -1057,7 +1073,7 @@ struct TempDir {
 impl TempDir {
     fn new() -> Result<Self> {
         let path = env::temp_dir().join(format!(
-            "hex-gist-sync-update-{}-{}",
+            "hex-sync-update-{}-{}",
             std::process::id(),
             timestamp_nanos()
         ));
@@ -1112,7 +1128,7 @@ fn replace_binary(downloaded: &Path, current: &Path) -> Result<()> {
     let pending = current.with_extension("new.exe");
     fs::copy(downloaded, &pending)?;
 
-    let script = env::temp_dir().join(format!("hex-gist-sync-update-{}.cmd", timestamp_nanos()));
+    let script = env::temp_dir().join(format!("hex-sync-update-{}.cmd", timestamp_nanos()));
     let contents = format!(
         "@echo off\n:wait\nping -n 2 127.0.0.1 >nul\nmove /Y \"{}\" \"{}\" >nul\nif exist \"{}\" goto wait\ndel \"%~f0\"\n",
         pending.display(),
@@ -1234,7 +1250,7 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
 
             if let Ok((tag, _)) = latest_release() {
                 if tag.trim_start_matches('v') != env!("CARGO_PKG_VERSION") {
-                    println!("[watch] Update available: {tag}. Run 'hex-gist-sync self-update'.");
+                    println!("[watch] Update available: {tag}. Run 'hex-sync self-update'.");
                 }
             }
         }
@@ -1346,7 +1362,7 @@ fn install_service() -> Result<()> {
     fs::create_dir_all(path.parent().context("Service path has no parent")?)?;
 
     let mut content = format!(
-        "[Unit]\nDescription=Hex Gist Sync daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" watch\nRestart=always\nRestartSec=5\n",
+        "[Unit]\nDescription=Hex Sync daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" watch\nRestart=always\nRestartSec=5\n",
         executable.display()
     );
 
