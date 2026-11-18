@@ -16,6 +16,7 @@ Hex Gist Sync is a small Rust CLI that keeps the portable parts of Hex's `settin
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Updates](#updates)
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Automatic sync](#automatic-sync)
@@ -43,6 +44,7 @@ This tool syncs the settings you actually want to share and leaves everything el
 - Credentials and machine-specific fields are replaced before upload and restored on download.
 - Timestamped backup of `settings.json` before every `pull`.
 - No runtime dependencies beyond the GitHub CLI. No Python, bash or jq required.
+- `self-update` downloads the latest release binary directly from GitHub.
 
 ## How it works
 
@@ -83,6 +85,17 @@ cargo build --release
 
 The binary is written to `target/release/hex-gist-sync`, or `hex-gist-sync.exe` on Windows. The `cargo install --path .` command works the same way in PowerShell and Git Bash, as long as `cargo` is on your `PATH`.
 
+## Updates
+
+```bash
+hex-gist-sync self-update
+hex-gist-sync self-update --force
+```
+
+The command asks GitHub for the latest release, checks that a binary exists for this platform, downloads it with `gh release download` and replaces the running executable. On Windows the swap is applied by a small detached batch script right after the process exits, because Windows locks running executables. Use `--force` to reinstall the same version.
+
+The `watch` daemon checks GitHub every six hours and prints a notice when a newer release exists. It never replaces the binary on its own.
+
 ## Quick start
 
 On the first machine:
@@ -122,6 +135,7 @@ HEX_GIST_ID=0123456789abcdef0123456789abcdef hex-gist-sync pull
 | `diff` | List the paths that differ between the local file and the gist. |
 | `watch [--interval <seconds>]` | Run the sync daemon in the foreground. |
 | `history [--revisions]` | Show the signed change log, or native GitHub gist revisions. |
+| `self-update [--force]` | Replace the binary with the latest GitHub release asset. |
 | `install-service` | Install the daemon as a systemd user service or a scheduled task. |
 | `uninstall-service` | Remove the automatic sync service. |
 | `help` | Print usage and environment variables. |
@@ -232,8 +246,10 @@ If a machine has no local value for a machine-only field, `pull` omits that key 
 | | Linux | Windows |
 | --- | --- | --- |
 | Settings file | `$XDG_DATA_HOME/hex/settings.json` or `~/.local/share/hex/settings.json` | `hex/settings.json` or `anomaly/hex/settings.json` under `%APPDATA%` or `%LOCALAPPDATA%` |
-| Gist ID | `~/.config/hex-gist-sync/gist-id` | `%APPDATA%\hex-gist-sync\gist-id` |
+| Gist ID | `~/.local/share/hex/gist-id`, beside `settings.json` | `%APPDATA%\hex\gist-id`, beside `settings.json` |
 | Binary | `hex-gist-sync` | `hex-gist-sync.exe` |
+
+The gist ID lives in its own file inside the Hex data folder, right next to `settings.json`, so one folder carries both. If you set `HEX_SETTINGS_PATH`, the ID follows that directory by default. Installations from earlier versions that still have `gist-id` in the config directory keep working. `HEX_GIST_STATE_FILE` overrides both.
 
 The first existing settings file wins. If Hex stores its configuration somewhere else on your system, set `HEX_SETTINGS_PATH`.
 

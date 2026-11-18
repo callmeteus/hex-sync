@@ -7,12 +7,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
 const GIST_DESCRIPTION: &str = "Hex settings (hex-gist-sync)";
 const GIST_FORMAT: &str = "hex-gist-sync/v1";
 const HISTORY_LIMIT: usize = 50;
+const REPOSITORY: &str = "callmeteus/hex-sync";
+const STATE_FILENAME: &str = "gist-id";
 const SENTINEL: &str = "__HEX_SYNC_LOCAL__";
 
 // Values that belong to one machine only. Their whole subtree is replaced by a sentinel.
@@ -67,6 +69,7 @@ enum CommandKind {
     Diff,
     Watch { interval: u64 },
     History { revisions: bool },
+    SelfUpdate { force: bool },
     InstallService,
     UninstallService,
     Help,
@@ -102,6 +105,7 @@ fn run() -> Result<()> {
         CommandKind::Diff => cmd_diff(&options),
         CommandKind::Watch { interval } => cmd_watch(&options, *interval),
         CommandKind::History { revisions } => cmd_history(&options, *revisions),
+        CommandKind::SelfUpdate { force } => cmd_self_update(*force),
         CommandKind::InstallService => install_service(),
         CommandKind::UninstallService => uninstall_service(),
     }
@@ -119,6 +123,7 @@ fn print_help() {
            diff             Show whether the local file and the gist diverged.\n\
            watch             Run a daemon that syncs changes automatically.\n\
            history           Show which machines changed the gist.\n\
+           self-update       Replace the binary with the latest GitHub release.\n\
            install-service   Install the daemon as a systemd user service or scheduled task.\n\
            uninstall-service Remove the automatic sync service.\n\
            help              Show this help.\n\
@@ -128,6 +133,9 @@ fn print_help() {
          \n\
          History options:\n\
            --revisions           Show native GitHub gist revisions instead.\n\
+         \n\
+         Self-update options:\n\
+           --force               Replace the binary even when the version matches.\n\
          \n\
          Environment variables:\n\
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
@@ -216,6 +224,19 @@ fn parse_args() -> Result<Options> {
 
             CommandKind::History { revisions }
         }
+        Some("self-update") => {
+            let force = args.iter().skip(1).any(|argument| argument == "--force");
+
+            if let Some(unknown) = args
+                .iter()
+                .skip(1)
+                .find(|argument| argument.as_str() != "--force")
+            {
+                bail!("Unknown self-update option: {unknown}");
+            }
+
+            CommandKind::SelfUpdate { force }
+        }
         Some("install-service") => CommandKind::InstallService,
         Some("uninstall-service") => CommandKind::UninstallService,
         Some("help") | Some("--help") | Some("-h") | None => CommandKind::Help,
@@ -230,7 +251,7 @@ fn parse_args() -> Result<Options> {
     let state_file = env::var_os("HEX_GIST_STATE_FILE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(default_state_file);
+        .unwrap_or_else(|| default_state_file(&settings_path));
 
     let gist_filename = env::var("HEX_GIST_FILE")
         .ok()
@@ -292,16 +313,30 @@ fn detect_settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("settings.json"))
 }
 
-fn default_state_file() -> PathBuf {
-    if let Some(directory) = dirs::config_dir() {
-        return directory.join("hex-gist-sync").join("gist-id");
+fn default_state_file(settings_path: &Path) -> PathBuf {
+    let beside_settings = settings_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(STATE_FILENAME);
+
+    if beside_settings.is_file() {
+        return beside_settings;
     }
 
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".config/hex-gist-sync/gist-id");
+    // Earlier versions stored the ID in the config dir. Keep reading it when present.
+    let legacy = dirs::config_dir()
+        .map(|directory| directory.join("hex-gist-sync").join(STATE_FILENAME))
+        .or_else(|| {
+            dirs::home_dir().map(|home| home.join(".config/hex-gist-sync").join(STATE_FILENAME))
+        });
+
+    if let Some(path) = legacy {
+        if path.is_file() {
+            return path;
+        }
     }
 
-    PathBuf::from("hex-gist-sync/gist-id")
+    beside_settings
 }
 
 fn normalize_id(value: &str) -> Result<String> {
@@ -973,6 +1008,150 @@ fn remote_snapshot(options: &Options, id: &str) -> Result<String> {
     Ok(to_json_string(&settings)?.trim_end().to_string())
 }
 
+fn release_asset_name() -> Result<String> {
+    let asset = match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => "hex-gist-sync-linux-x86_64",
+        ("windows", "x86_64") => "hex-gist-sync-windows-x86_64.exe",
+        (os, arch) => bail!("No release binary published for {os} on {arch}"),
+    };
+
+    Ok(asset.to_string())
+}
+
+fn latest_release() -> Result<(String, String)> {
+    require_auth()?;
+
+    let raw = run_gh(
+        &["api", &format!("repos/{REPOSITORY}/releases/latest")],
+        None,
+    )?;
+    let release: Value =
+        serde_json::from_str(&raw).context("Invalid release response from gh api")?;
+    let tag = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .context("Release has no tag_name")?
+        .to_string();
+    let asset = release_asset_name()?;
+    let available = release
+        .get("assets")
+        .and_then(Value::as_array)
+        .map(|assets| {
+            assets
+                .iter()
+                .any(|item| item.get("name").and_then(Value::as_str) == Some(asset.as_str()))
+        })
+        .unwrap_or(false);
+
+    if !available {
+        bail!("Release {tag} has no asset named {asset}");
+    }
+
+    Ok((tag, asset))
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        let path = env::temp_dir().join(format!(
+            "hex-gist-sync-update-{}-{}",
+            std::process::id(),
+            timestamp_nanos()
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn download_release(tag: &str, asset: &str, destination: &Path) -> Result<PathBuf> {
+    let directory = destination.to_string_lossy().into_owned();
+
+    run_gh(
+        &[
+            "release",
+            "download",
+            tag,
+            "--pattern",
+            asset,
+            "--dir",
+            &directory,
+            "--clobber",
+        ],
+        None,
+    )?;
+
+    let file = destination.join(asset);
+
+    if !file.is_file() {
+        bail!("Release asset was not downloaded: {asset}");
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn replace_binary(downloaded: &Path, current: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(downloaded, fs::Permissions::from_mode(0o755))?;
+    fs::rename(downloaded, current)
+        .with_context(|| format!("Could not replace {}", current.display()))
+}
+
+#[cfg(windows)]
+fn replace_binary(downloaded: &Path, current: &Path) -> Result<()> {
+    // Windows locks the running executable, so a detached batch applies the swap after exit.
+    let pending = current.with_extension("new.exe");
+    fs::copy(downloaded, &pending)?;
+
+    let script = env::temp_dir().join(format!("hex-gist-sync-update-{}.cmd", timestamp_nanos()));
+    let contents = format!(
+        "@echo off\n:wait\nping -n 2 127.0.0.1 >nul\nmove /Y \"{}\" \"{}\" >nul\nif exist \"{}\" goto wait\ndel \"%~f0\"\n",
+        pending.display(),
+        current.display(),
+        pending.display()
+    );
+    fs::write(&script, contents)?;
+
+    let script_path = script.to_string_lossy().into_owned();
+    Command::new("cmd")
+        .args(["/C", "start", "", "/MIN", &script_path])
+        .spawn()
+        .context("Could not start the update script")?;
+
+    Ok(())
+}
+
+fn cmd_self_update(force: bool) -> Result<()> {
+    let (tag, asset) = latest_release()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    if !force && tag.trim_start_matches('v') == current_version {
+        println!("Already up to date ({current_version}).");
+        return Ok(());
+    }
+
+    let temporary = TempDir::new()?;
+    let downloaded = download_release(&tag, &asset, &temporary.path)?;
+    let executable = env::current_exe()?.canonicalize()?;
+    replace_binary(&downloaded, &executable)?;
+
+    println!("Updated {current_version} -> {tag}.");
+
+    #[cfg(windows)]
+    println!("The update is applied as this process exits.");
+
+    Ok(())
+}
+
 fn cmd_history(options: &Options, revisions: bool) -> Result<()> {
     require_auth()?;
 
@@ -1042,7 +1221,24 @@ fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
 
     println!("[watch] Watching every {interval}s. Press Ctrl+C to stop.");
 
+    let mut last_update_check: Option<Instant> = None;
+
     loop {
+        let due_for_check = match last_update_check {
+            Some(instant) => instant.elapsed() >= Duration::from_secs(6 * 60 * 60),
+            None => true,
+        };
+
+        if due_for_check {
+            last_update_check = Some(Instant::now());
+
+            if let Ok((tag, _)) = latest_release() {
+                if tag.trim_start_matches('v') != env!("CARGO_PKG_VERSION") {
+                    println!("[watch] Update available: {tag}. Run 'hex-gist-sync self-update'.");
+                }
+            }
+        }
+
         sleep(Duration::from_secs(interval));
 
         let local = match local_snapshot(options) {
