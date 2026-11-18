@@ -10,14 +10,14 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIST_FILENAME: &str = "hex-settings.json";
-const SETTINGS_FILENAME: &str = "hs-settings.json";
-const LEGACY_SETTINGS_FILENAME: &str = "settings.json";
+const SETTINGS_FILENAME: &str = "settings.json";
+const STATE_FILENAME: &str = "hs-settings.json";
+const LEGACY_STATE_FILENAME: &str = "gist-id";
 const GIST_DESCRIPTION: &str = "Hex settings (hex-sync)";
 const GIST_FORMAT: &str = "hex-sync/v1";
 const LEGACY_GIST_FORMAT: &str = "hex-gist-sync/v1";
 const HISTORY_LIMIT: usize = 50;
 const REPOSITORY: &str = "callmeteus/hex-sync";
-const STATE_FILENAME: &str = "gist-id";
 const SENTINEL: &str = "__HEX_SYNC_LOCAL__";
 
 // Values that belong to one machine only. Their whole subtree is replaced by a sentinel.
@@ -144,7 +144,7 @@ fn print_help() {
            HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
            HEX_SETTINGS_PATH    Path to the Hex settings file.\n\
            HEX_GIST_FILE        Name of the file inside the gist.\n\
-           HEX_GIST_STATE_FILE  Where the gist ID is stored.\n\
+           HEX_GIST_STATE_FILE  Path to the CLI config (hs-settings.json).\n\
            HEX_GIST_PUBLIC      Set to 1 with init to create a public gist.\n\
            HEX_SYNC_INTERVAL    Default watch interval in seconds."
     );
@@ -276,29 +276,19 @@ fn parse_args() -> Result<Options> {
     })
 }
 
-fn push_settings_candidates(
-    preferred: &mut Vec<PathBuf>,
-    legacy: &mut Vec<PathBuf>,
-    base: PathBuf,
-) {
-    preferred.push(base.join(SETTINGS_FILENAME));
-    legacy.push(base.join(LEGACY_SETTINGS_FILENAME));
-}
-
 fn detect_settings_path() -> PathBuf {
-    let mut preferred = Vec::new();
-    let mut legacy = Vec::new();
+    let mut candidates = Vec::new();
 
     if let Some(directory) = dirs::data_dir() {
-        push_settings_candidates(&mut preferred, &mut legacy, directory.join("hex"));
+        candidates.push(directory.join("hex").join(SETTINGS_FILENAME));
     }
 
     if let Some(directory) = dirs::data_local_dir() {
-        push_settings_candidates(&mut preferred, &mut legacy, directory.join("hex"));
+        candidates.push(directory.join("hex").join(SETTINGS_FILENAME));
     }
 
     if let Some(home) = dirs::home_dir() {
-        push_settings_candidates(&mut preferred, &mut legacy, home.join(".local/share/hex"));
+        candidates.push(home.join(".local/share/hex").join(SETTINGS_FILENAME));
     }
 
     #[cfg(windows)]
@@ -307,53 +297,70 @@ fn detect_settings_path() -> PathBuf {
         for variable in ["APPDATA", "LOCALAPPDATA"] {
             if let Some(directory) = env::var_os(variable) {
                 let base = PathBuf::from(directory);
-                push_settings_candidates(&mut preferred, &mut legacy, base.join("hex"));
-                push_settings_candidates(
-                    &mut preferred,
-                    &mut legacy,
-                    base.join("anomaly").join("hex"),
-                );
+                candidates.push(base.join("hex").join(SETTINGS_FILENAME));
+                candidates.push(base.join("anomaly").join("hex").join(SETTINGS_FILENAME));
             }
         }
     }
 
     let mut seen = BTreeSet::new();
-    for candidate in preferred.iter().chain(legacy.iter()) {
+    for candidate in &candidates {
         if seen.insert(candidate.clone()) && candidate.is_file() {
             return candidate.clone();
         }
     }
 
-    preferred
+    candidates
         .into_iter()
         .next()
         .unwrap_or_else(|| PathBuf::from(SETTINGS_FILENAME))
 }
 
 fn default_state_file(settings_path: &Path) -> PathBuf {
-    let beside_settings = settings_path
+    settings_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(STATE_FILENAME);
+        .join(STATE_FILENAME)
+}
 
-    if beside_settings.is_file() {
-        return beside_settings;
+fn legacy_state_files(settings_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![settings_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(LEGACY_STATE_FILENAME)];
+
+    if let Some(directory) = dirs::config_dir() {
+        paths.push(directory.join("hex-sync").join(LEGACY_STATE_FILENAME));
+        paths.push(directory.join("hex-gist-sync").join(LEGACY_STATE_FILENAME));
     }
 
-    // Earlier versions stored the ID in the config dir. Keep reading it when present.
-    let legacy = dirs::config_dir()
-        .map(|directory| directory.join("hex-gist-sync").join(STATE_FILENAME))
-        .or_else(|| {
-            dirs::home_dir().map(|home| home.join(".config/hex-gist-sync").join(STATE_FILENAME))
-        });
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".config/hex-sync").join(LEGACY_STATE_FILENAME));
+        paths.push(
+            home.join(".config/hex-gist-sync")
+                .join(LEGACY_STATE_FILENAME),
+        );
+    }
 
-    if let Some(path) = legacy {
-        if path.is_file() {
-            return path;
+    paths
+}
+
+fn read_state_file(path: &Path) -> Result<Option<String>> {
+    let contents = fs::read_to_string(path)?;
+
+    if let Ok(value) = serde_json::from_str::<Value>(&contents) {
+        if let Some(id) = value.get("gistId").and_then(Value::as_str) {
+            return Ok(Some(id.to_string()));
         }
     }
 
-    beside_settings
+    // Earlier versions stored the bare ID as plain text.
+    let trimmed = contents.trim();
+    if !trimmed.is_empty() {
+        return Ok(Some(trimmed.to_string()));
+    }
+
+    Ok(None)
 }
 
 fn normalize_id(value: &str) -> Result<String> {
@@ -638,22 +645,45 @@ fn resolve_gist_id(options: &Options) -> Result<String> {
         return Ok(id.clone());
     }
 
-    let contents = fs::read_to_string(&options.state_file).with_context(|| {
-        format!(
-            "No gist configured. Run 'init' or 'use <id>' first. (state file: {})",
-            options.state_file.display()
-        )
-    })?;
+    if options.state_file.is_file() {
+        if let Some(id) = read_state_file(&options.state_file)? {
+            return normalize_id(&id);
+        }
+    }
 
-    normalize_id(contents.trim())
+    for path in legacy_state_files(&options.settings_path) {
+        if path.is_file() {
+            if let Some(id) = read_state_file(&path)? {
+                return normalize_id(&id);
+            }
+        }
+    }
+
+    bail!(
+        "No gist configured. Run 'init' or 'use <id>' first. (config file: {})",
+        options.state_file.display()
+    )
 }
 
 fn save_gist_id(path: &Path, id: &str) -> Result<()> {
+    let mut config = Map::new();
+
+    if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(value) = serde_json::from_str::<Value>(&contents) {
+            if let Some(object) = value.as_object() {
+                config = object.clone();
+            }
+        }
+    }
+
+    config.insert("version".to_string(), Value::from(1));
+    config.insert("gistId".to_string(), Value::String(id.to_string()));
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    fs::write(path, format!("{id}\n"))?;
+    fs::write(path, to_json_string(&Value::Object(config))?)?;
 
     #[cfg(unix)]
     {
