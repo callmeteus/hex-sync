@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
@@ -73,8 +73,8 @@ enum CommandKind {
     Watch { interval: u64 },
     History { revisions: bool },
     SelfUpdate { force: bool },
-    InstallService,
-    UninstallService,
+    ServiceInstall,
+    ServiceUninstall,
     Help,
 }
 
@@ -109,8 +109,8 @@ fn run() -> Result<()> {
         CommandKind::Watch { interval } => cmd_watch(&options, *interval),
         CommandKind::History { revisions } => cmd_history(&options, *revisions),
         CommandKind::SelfUpdate { force } => cmd_self_update(*force),
-        CommandKind::InstallService => install_service(),
-        CommandKind::UninstallService => uninstall_service(),
+        CommandKind::ServiceInstall => install_service(),
+        CommandKind::ServiceUninstall => uninstall_service(),
     }
 }
 
@@ -127,8 +127,8 @@ fn print_help() {
            watch             Run a daemon that syncs changes automatically.\n\
            history           Show which machines changed the gist.\n\
            self-update       Replace the binary with the latest GitHub release.\n\
-           install-service   Install the daemon as a systemd user service or scheduled task.\n\
-           uninstall-service Remove the automatic sync service.\n\
+           service install   Install the daemon as a systemd user service or scheduled task.\n\
+           service uninstall Remove the automatic sync service.\n\
            help              Show this help.\n\
          \n\
          Watch options:\n\
@@ -240,8 +240,15 @@ fn parse_args() -> Result<Options> {
 
             CommandKind::SelfUpdate { force }
         }
-        Some("install-service") => CommandKind::InstallService,
-        Some("uninstall-service") => CommandKind::UninstallService,
+        Some("service") => match args.get(1).map(String::as_str) {
+            Some("install") => CommandKind::ServiceInstall,
+            Some("uninstall") => CommandKind::ServiceUninstall,
+            Some(other) => bail!("Unknown service command: {other}"),
+            None => bail!("Usage: hex-sync service <install|uninstall>"),
+        },
+        // Kept as aliases so existing installs do not break.
+        Some("install-service") => CommandKind::ServiceInstall,
+        Some("uninstall-service") => CommandKind::ServiceUninstall,
         Some("help") | Some("--help") | Some("-h") | None => CommandKind::Help,
         Some(other) => bail!("Unknown command: {other}"),
     };
@@ -361,6 +368,148 @@ fn read_state_file(path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+struct GistCandidate {
+    id: String,
+    description: String,
+    updated: String,
+    machines: Vec<String>,
+}
+
+fn has_configured_gist(options: &Options) -> bool {
+    options.gist_id.is_some()
+        || options.state_file.is_file()
+        || legacy_state_files(&options.settings_path)
+            .iter()
+            .any(|path| path.is_file())
+}
+
+fn find_candidate_gists(options: &Options) -> Result<Vec<GistCandidate>> {
+    let raw = run_gh(&["gist", "list", "--limit", "100"], None)?;
+    let mut candidates = Vec::new();
+
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+
+        if parts.len() < 5 {
+            continue;
+        }
+
+        let description = parts[1].to_ascii_lowercase();
+        if !description.contains("hex settings") && !description.contains("hex-sync") {
+            continue;
+        }
+
+        let id = parts[0].to_string();
+        let contents = match run_gh(
+            &[
+                "gist",
+                "view",
+                &id,
+                "--filename",
+                &options.gist_filename,
+                "--raw",
+            ],
+            None,
+        ) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        let document: Value = match serde_json::from_str(&contents) {
+            Ok(document) => document,
+            Err(_) => continue,
+        };
+
+        let settings = match extract_settings(&document) {
+            Ok(settings) => settings,
+            Err(_) => continue,
+        };
+
+        if !settings.is_object() || settings.as_object().is_some_and(Map::is_empty) {
+            continue;
+        }
+
+        let machines: BTreeSet<String> = extract_history(&document)
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("machine")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        candidates.push(GistCandidate {
+            id,
+            description: parts[1].to_string(),
+            updated: parts[4].to_string(),
+            machines: machines.into_iter().collect(),
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn suggest_existing_gist(options: &Options) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+
+    let candidates = find_candidate_gists(options)?;
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    println!("Found existing Hex settings gists:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        let machines = if candidate.machines.is_empty() {
+            "unknown machine".to_string()
+        } else {
+            candidate.machines.join(", ")
+        };
+
+        println!(
+            "  {}) {} | {} | updated {} | machines: {}",
+            index + 1,
+            candidate.id,
+            candidate.description,
+            candidate.updated,
+            machines
+        );
+    }
+
+    print!("Use one of these? Enter a number or gist ID, or press Enter to create a new gist: ");
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+
+    if answer.is_empty() {
+        println!("Creating a new gist.");
+        return Ok(false);
+    }
+
+    let id = match answer.parse::<usize>() {
+        Ok(number) if number >= 1 && number <= candidates.len() => {
+            candidates[number - 1].id.clone()
+        }
+        _ => match normalize_id(answer) {
+            Ok(id) => id,
+            Err(_) => {
+                println!("Not a valid choice, creating a new gist.");
+                return Ok(false);
+            }
+        },
+    };
+
+    save_gist_id(&options.state_file, &id)?;
+    println!("Using existing gist {id}.");
+    println!("Run 'hex-sync pull' to download its settings.");
+
+    Ok(true)
 }
 
 fn normalize_id(value: &str) -> Result<String> {
@@ -888,6 +1037,10 @@ fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
 fn cmd_init(options: &Options, public: bool) -> Result<()> {
     require_auth()?;
 
+    if !has_configured_gist(options) && suggest_existing_gist(options)? {
+        return Ok(());
+    }
+
     let settings = read_settings(&options.settings_path)?;
     let sanitized = to_json_string(&build_document(
         &sanitize(&settings, &[]),
@@ -1253,6 +1406,10 @@ fn cmd_history(options: &Options, revisions: bool) -> Result<()> {
 
 fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
     require_auth()?;
+
+    if !has_configured_gist(options) {
+        let _ = suggest_existing_gist(options);
+    }
 
     let id = resolve_gist_id(options)?;
 
