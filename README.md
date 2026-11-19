@@ -70,6 +70,31 @@ Runtime files such as `history.json`, `local-api.json`, `session.env` and token 
 
 ## Installation
 
+### Online installers
+
+One command downloads and installs the latest release binary.
+
+**Windows (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/callmeteus/hex-sync/master/install-windows.ps1 -OutFile install-windows.ps1; ./install-windows.ps1"
+```
+
+**Linux (sh):**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/callmeteus/hex-sync/master/install-linux.sh | sh
+```
+
+The Windows installer puts `hex-sync.exe` in `%LOCALAPPDATA%\hex-sync\bin` and adds that folder to your user `PATH`. The Linux installer puts `hex-sync` in `~/.local/bin`. Set `HEX_SYNC_INSTALL_DIR` to change the destination, or `HEX_SYNC_VERSION` (for example `v0.1.0`) to pin a specific release instead of the latest one.
+
+### Direct download
+
+| Platform | Binary |
+| --- | --- |
+| Linux x86_64 | [hex-sync-linux-x86_64](https://github.com/callmeteus/hex-sync/releases/latest/download/hex-sync-linux-x86_64) |
+| Windows x86_64 | [hex-sync-windows-x86_64.exe](https://github.com/callmeteus/hex-sync/releases/latest/download/hex-sync-windows-x86_64.exe) |
+
 Prebuilt binaries for Linux and Windows are attached to every [GitHub release](https://github.com/callmeteus/hex-sync/releases). Download the one for your platform and put it on your `PATH`.
 
 To build from source:
