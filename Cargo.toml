@@ -1,6 +1,6 @@
 [package]
 name = "hex-sync"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Portable Hex settings synced through a GitHub gist"
 license = "MIT"

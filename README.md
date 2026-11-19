@@ -86,7 +86,7 @@ powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.c
 curl -fsSL https://raw.githubusercontent.com/callmeteus/hex-sync/master/install-linux.sh | sh
 ```
 
-The Windows installer puts `hex-sync.exe` in `%LOCALAPPDATA%\hex-sync\bin` and adds that folder to your user `PATH`. The Linux installer puts `hex-sync` in `~/.local/bin`. Set `HEX_SYNC_INSTALL_DIR` to change the destination, or `HEX_SYNC_VERSION` (for example `v0.1.0`) to pin a specific release instead of the latest one.
+The Windows installer puts `hex-sync.exe` in `%LOCALAPPDATA%\hex-sync\bin` and adds that folder to your user `PATH`. The Linux installer puts `hex-sync` in `~/.local/bin`. Set `HEX_SYNC_INSTALL_DIR` to change the destination, or `HEX_SYNC_VERSION` (for example `v0.1.1`) to pin a specific release instead of the latest one.
 
 ### Direct download
 
