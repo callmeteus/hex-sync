@@ -65,10 +65,11 @@ const LOCAL_PATHS: &[&[&str]] = &[
 
 #[derive(Debug)]
 enum CommandKind {
-    Init { public: bool },
+    Init { public: bool, new: bool },
     Use(String),
     Push,
     Pull,
+    Sync,
     Diff,
     Watch { interval: u64 },
     History { revisions: bool },
@@ -101,10 +102,11 @@ fn run() -> Result<()> {
             print_help();
             Ok(())
         }
-        CommandKind::Init { public } => cmd_init(&options, *public),
+        CommandKind::Init { public, new } => cmd_init(&options, *public, *new),
         CommandKind::Use(value) => cmd_use(&options, value),
         CommandKind::Push => cmd_push(&options),
         CommandKind::Pull => cmd_pull(&options),
+        CommandKind::Sync => cmd_sync(&options),
         CommandKind::Diff => cmd_diff(&options),
         CommandKind::Watch { interval } => cmd_watch(&options, *interval),
         CommandKind::History { revisions } => cmd_history(&options, *revisions),
@@ -119,10 +121,11 @@ fn print_help() {
         "Usage: hex-sync <command> [options]\n\
          \n\
          Commands:\n\
-           init [--public]  Create a gist with the current settings and save its ID locally.\n\
+           init [--public]  Create a gist, or reuse an existing one, and save its ID locally.\n\
            use <id|url>     Point this machine to an existing gist.\n\
            push             Upload local settings to the gist.\n\
            pull             Download settings from the gist, preserving local secrets.\n\
+           sync             Sync automatically: push local changes, pull gist changes.\n\
            diff             Show whether the local file and the gist diverged.\n\
            watch             Run a daemon that syncs changes automatically.\n\
            history           Show which machines changed the gist.\n\
@@ -131,22 +134,17 @@ fn print_help() {
            service uninstall Remove the automatic sync service.\n\
            help              Show this help.\n\
          \n\
+         Init options:\n\
+           --new                Always create a new gist instead of reusing one.\n\
+         \n\
          Watch options:\n\
-           --interval <seconds>  Poll interval, default 15 (or HEX_SYNC_INTERVAL).\n\
+           --interval <seconds>  Poll interval, default 15.\n\
          \n\
          History options:\n\
            --revisions           Show native GitHub gist revisions instead.\n\
          \n\
          Self-update options:\n\
-           --force               Replace the binary even when the version matches.\n\
-         \n\
-         Environment variables:\n\
-           HEX_GIST_ID          Gist ID, takes precedence over the state file.\n\
-           HEX_SETTINGS_PATH    Path to the Hex settings file.\n\
-           HEX_GIST_FILE        Name of the file inside the gist.\n\
-           HEX_GIST_STATE_FILE  Path to the CLI config (hs-settings.json).\n\
-           HEX_GIST_PUBLIC      Set to 1 with init to create a public gist.\n\
-           HEX_SYNC_INTERVAL    Default watch interval in seconds."
+           --force               Replace the binary even when the version matches."
     );
 }
 
@@ -159,16 +157,17 @@ fn parse_args() -> Result<Options> {
                 || env::var("HEX_GIST_PUBLIC")
                     .map(|value| value == "1")
                     .unwrap_or(false);
+            let new = args.iter().skip(1).any(|argument| argument == "--new");
 
             if let Some(unknown) = args
                 .iter()
                 .skip(1)
-                .find(|argument| argument.as_str() != "--public")
+                .find(|argument| argument.as_str() != "--public" && argument.as_str() != "--new")
             {
                 bail!("Unknown init option: {unknown}");
             }
 
-            CommandKind::Init { public }
+            CommandKind::Init { public, new }
         }
         Some("use") => {
             let value = args.get(1).context(
@@ -178,6 +177,7 @@ fn parse_args() -> Result<Options> {
         }
         Some("push") => CommandKind::Push,
         Some("pull") => CommandKind::Pull,
+        Some("sync") => CommandKind::Sync,
         Some("diff") => CommandKind::Diff,
         Some("watch") => {
             let mut interval = env::var("HEX_SYNC_INTERVAL")
@@ -453,13 +453,28 @@ fn find_candidate_gists(options: &Options) -> Result<Vec<GistCandidate>> {
 }
 
 fn suggest_existing_gist(options: &Options) -> Result<bool> {
-    if !io::stdin().is_terminal() {
-        return Ok(false);
-    }
-
     let candidates = find_candidate_gists(options)?;
     if candidates.is_empty() {
         return Ok(false);
+    }
+
+    if candidates.len() == 1 {
+        let id = &candidates[0].id;
+        save_gist_id(&options.state_file, id)?;
+        println!("Reusing existing gist {id}.");
+        println!("Run 'hex-sync pull' to download its settings.");
+        return Ok(true);
+    }
+
+    if !io::stdin().is_terminal() {
+        let newest = candidates
+            .iter()
+            .max_by(|left, right| left.updated.cmp(&right.updated))
+            .context("No gist candidate available")?;
+        save_gist_id(&options.state_file, &newest.id)?;
+        println!("Reusing most recently updated gist {}.", newest.id);
+        println!("Run 'hex-sync pull' to download its settings.");
+        return Ok(true);
     }
 
     println!("Found existing Hex settings gists:");
@@ -814,19 +829,19 @@ fn resolve_gist_id(options: &Options) -> Result<String> {
     )
 }
 
-fn save_gist_id(path: &Path, id: &str) -> Result<()> {
+fn save_state_value(path: &Path, key: &str, value: Value) -> Result<()> {
     let mut config = Map::new();
 
     if let Ok(contents) = fs::read_to_string(path) {
-        if let Ok(value) = serde_json::from_str::<Value>(&contents) {
-            if let Some(object) = value.as_object() {
+        if let Ok(existing) = serde_json::from_str::<Value>(&contents) {
+            if let Some(object) = existing.as_object() {
                 config = object.clone();
             }
         }
     }
 
     config.insert("version".to_string(), Value::from(1));
-    config.insert("gistId".to_string(), Value::String(id.to_string()));
+    config.insert(key.to_string(), value);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -841,6 +856,30 @@ fn save_gist_id(path: &Path, id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn save_gist_id(path: &Path, id: &str) -> Result<()> {
+    save_state_value(path, "gistId", Value::String(id.to_string()))
+}
+
+fn read_sync_hash(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    value.get("syncHash")?.as_str().map(str::to_string)
+}
+
+fn save_sync_hash(path: &Path, hash: &str) -> Result<()> {
+    save_state_value(path, "syncHash", Value::String(hash.to_string()))
+}
+
+fn settings_hash(settings: &Value) -> Result<String> {
+    let json = to_json_string(settings)?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in json.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 fn timestamp_secs() -> u64 {
@@ -1034,18 +1073,16 @@ fn fetch_remote(options: &Options, id: &str) -> Result<Value> {
     extract_settings(&document)
 }
 
-fn cmd_init(options: &Options, public: bool) -> Result<()> {
+fn cmd_init(options: &Options, public: bool, new: bool) -> Result<()> {
     require_auth()?;
 
-    if !has_configured_gist(options) && suggest_existing_gist(options)? {
+    if !new && !has_configured_gist(options) && suggest_existing_gist(options)? {
         return Ok(());
     }
 
     let settings = read_settings(&options.settings_path)?;
-    let sanitized = to_json_string(&build_document(
-        &sanitize(&settings, &[]),
-        &[history_entry("init")],
-    ))?;
+    let portable = sanitize(&settings, &[]);
+    let sanitized = to_json_string(&build_document(&portable, &[history_entry("init")]))?;
 
     let mut arguments = vec![
         "gist".to_string(),
@@ -1071,6 +1108,7 @@ fn cmd_init(options: &Options, public: bool) -> Result<()> {
 
     let id = normalize_id(url.trim().trim_end_matches('/'))?;
     save_gist_id(&options.state_file, &id)?;
+    save_sync_hash(&options.state_file, &settings_hash(&portable)?)?;
 
     println!("Gist ID saved to: {}", options.state_file.display());
     println!("Gist created: {}", url.trim());
@@ -1104,7 +1142,8 @@ fn push_to_gist(options: &Options, id: &str, action: &str) -> Result<()> {
         history.drain(..excess);
     }
 
-    let sanitized = to_json_string(&build_document(&sanitize(&settings, &[]), &history))?;
+    let portable = sanitize(&settings, &[]);
+    let sanitized = to_json_string(&build_document(&portable, &history))?;
     let temporary = TempFile::new(&sanitized)?;
     let path = temporary.path.to_string_lossy().into_owned();
 
@@ -1119,6 +1158,7 @@ fn push_to_gist(options: &Options, id: &str, action: &str) -> Result<()> {
         ],
         None,
     )?;
+    save_sync_hash(&options.state_file, &settings_hash(&portable)?)?;
 
     Ok(())
 }
@@ -1161,8 +1201,74 @@ fn pull_from_gist(options: &Options, id: &str) -> Result<Option<PathBuf>> {
     }
 
     write_settings(&options.settings_path, &merged)?;
+    save_sync_hash(&options.state_file, &settings_hash(&remote)?)?;
 
     Ok(backup_path)
+}
+
+fn cmd_sync(options: &Options) -> Result<()> {
+    require_auth()?;
+    let id = resolve_gist_id(options)?;
+
+    let local = if options.settings_path.is_file() {
+        Some(sanitize(&read_settings(&options.settings_path)?, &[]))
+    } else {
+        None
+    };
+    let remote = fetch_remote(options, &id)?;
+    let local_json = match &local {
+        Some(value) => Some(to_json_string(value)?),
+        None => None,
+    };
+    let remote_json = to_json_string(&remote)?;
+
+    if let Some(current) = &local_json {
+        if current == &remote_json {
+            save_sync_hash(&options.state_file, &settings_hash(&remote)?)?;
+            println!("Local settings and gist are in sync.");
+            return Ok(());
+        }
+    }
+
+    let local_hash = match &local {
+        Some(value) => Some(settings_hash(value)?),
+        None => None,
+    };
+    let remote_hash = settings_hash(&remote)?;
+    let stored = read_sync_hash(&options.state_file);
+
+    let push = match (stored.as_ref(), local_hash.as_ref()) {
+        (_, None) => {
+            println!("No local settings found. Pulling from gist {id}.");
+            false
+        }
+        (None, Some(_)) => {
+            println!("No previous sync state found. Treating the gist as the source of truth.");
+            false
+        }
+        (Some(previous), Some(current)) if previous == current => {
+            println!("Gist changed since the last sync. Pulling into local settings.");
+            false
+        }
+        (Some(previous), _) if previous == &remote_hash => {
+            println!("Local settings changed since the last sync. Pushing to gist {id}.");
+            true
+        }
+        _ => bail!(
+            "Conflict: settings and gist both changed since the last sync. Run 'push' or 'pull' manually to resolve."
+        ),
+    };
+
+    if push {
+        push_to_gist(options, &id, "sync")?;
+        println!("Pushed local settings to gist {id}.");
+    } else {
+        pull_from_gist(options, &id)?;
+        println!("Pulled settings from gist {id}.");
+        println!("Restart Hex if it is running, so it reloads the settings.");
+    }
+
+    Ok(())
 }
 
 fn cmd_diff(options: &Options) -> Result<()> {
@@ -1179,7 +1285,7 @@ fn cmd_diff(options: &Options) -> Result<()> {
     if differences.is_empty() {
         println!("Local settings and gist are in sync.");
     } else {
-        println!("Settings diverged. Run push or pull.");
+        println!("Settings diverged. Run sync, push or pull.");
         for difference in differences {
             println!("  {difference}");
         }

@@ -37,7 +37,7 @@ This tool syncs the settings you actually want to share and leaves everything el
 
 ## Features
 
-- Bidirectional sync through a GitHub gist: `push`, `pull` and a read-only `diff`.
+- Bidirectional sync through a GitHub gist: one-shot `sync`, manual `push` and `pull`, and a read-only `diff`.
 - An optional daemon that watches both sides and syncs changes automatically.
 - A signed change log inside the gist that records which machine, user and OS changed it.
 - Works on Linux and Windows with the same commands and the same gist.
@@ -86,7 +86,7 @@ powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.c
 curl -fsSL https://raw.githubusercontent.com/callmeteus/hex-sync/master/install-linux.sh | sh
 ```
 
-The Windows installer puts `hex-sync.exe` in `%LOCALAPPDATA%\hex-sync\bin` and adds that folder to your user `PATH`. The Linux installer puts `hex-sync` in `~/.local/bin`. Set `HEX_SYNC_INSTALL_DIR` to change the destination, or `HEX_SYNC_VERSION` (for example `v0.1.1`) to pin a specific release instead of the latest one.
+The Windows installer puts `hex-sync.exe` in `%LOCALAPPDATA%\hex-sync\bin` and adds that folder to your user `PATH`. The Linux installer puts `hex-sync` in `~/.local/bin`. Set `HEX_SYNC_INSTALL_DIR` to change the destination, or `HEX_SYNC_VERSION` (for example `v0.2.0`) to pin a specific release instead of the latest one.
 
 ### Direct download
 
@@ -131,11 +131,12 @@ Hex Sync keeps its own settings in `hs-settings.json`, stored in the Hex data fo
 ```json
 {
   "version": 1,
-  "gistId": "0123456789abcdef0123456789abcdef"
+  "gistId": "0123456789abcdef0123456789abcdef",
+  "syncHash": "e75df1593de4fce7"
 }
 ```
 
-The `gistId` is written there by `init` and `use`. The file is ours, not Hex's, so Hex's `settings.json` is never replaced by it. It is also where future sync destinations will be configured. The old plain-text `gist-id` file is still read for compatibility, and `HEX_GIST_STATE_FILE` can point elsewhere.
+The `gistId` is written there by `init` and `use`. The `syncHash` is a fingerprint of the last synchronized settings, updated by `sync`, `push`, `pull`, `init` and the daemon. It is what lets `sync` tell which side changed. The file is ours, not Hex's, so Hex's `settings.json` is never replaced by it. It is also where future sync destinations will be configured. The old plain-text `gist-id` file is still read for compatibility, and `HEX_GIST_STATE_FILE` can point elsewhere.
 
 ## Quick start
 
@@ -152,13 +153,19 @@ Gist created: https://gist.github.com/you/0123456789abcdef0123456789abcdef
 
 The gist is secret by default, so it is not publicly listed but remains accessible by URL. Use `hex-sync init --public` if you really want it listed.
 
-On a first run with no local config, `init` (and `watch`) searches your GitHub gists for Hex settings. If it finds any, it lists the gist ID, description, last update and the machines that changed it, then asks which one to use. Press Enter to create a new gist instead. The search only runs in an interactive terminal.
+On a first run with no local config, `init` (and `watch`) searches your GitHub gists for Hex settings. With a single match, that gist is reused automatically. With several matches, you are asked which one to use, or you can press Enter to create a new one. Use `hex-sync init --new` to always create a fresh gist.
 
 On the second machine:
 
 ```bash
 hex-sync use https://gist.github.com/you/0123456789abcdef0123456789abcdef
 hex-sync pull
+```
+
+After that, a single command keeps the two sides aligned:
+
+```bash
+hex-sync sync
 ```
 
 You can also skip storing the gist ID:
@@ -171,23 +178,32 @@ HEX_GIST_ID=0123456789abcdef0123456789abcdef hex-sync pull
 
 | Command | Description |
 | --- | --- |
-| `init [--public]` | Create a gist from the current settings and save its ID locally. |
+| `init [--public] [--new]` | Create a gist, or reuse an existing one, and save its ID locally. |
 | `use <id\|url>` | Point this machine to an existing gist. |
 | `push` | Upload sanitized local settings to the gist. |
 | `pull` | Download settings and merge local values back into them. |
+| `sync` | Sync once: push local changes, pull gist changes, or report a conflict. |
 | `diff` | List the paths that differ between the local file and the gist. |
 | `watch [--interval <seconds>]` | Run the sync daemon in the foreground. |
 | `history [--revisions]` | Show the signed change log, or native GitHub gist revisions. |
 | `self-update [--force]` | Replace the binary with the latest GitHub release asset. |
 | `service install` | Install the daemon as a systemd user service or a scheduled task. |
 | `service uninstall` | Remove the automatic sync service. |
-| `help` | Print usage and environment variables. |
+| `help` | Print usage. |
 
 The old `install-service` and `uninstall-service` names still work as aliases.
 
-The tool never picks a sync direction for you in `push`, `pull` or `diff`. If `diff` reports a difference, choose `push` or `pull` explicitly.
+`push`, `pull` and `diff` are explicit and never pick a direction for you. `sync` uses the fingerprint stored in `hs-settings.json` to detect which side changed and applies only that change. If both sides changed, it stops and asks you to resolve the conflict with `push` or `pull`. On a machine with no fingerprint yet, `sync` treats the gist as the source of truth and pulls.
 
 ## Automatic sync
+
+For a one-shot sync without a daemon, run:
+
+```bash
+hex-sync sync
+```
+
+It pushes when only the local settings changed, pulls when only the gist changed, and reports a conflict when both did. See [Commands](#commands) for how the direction is decided.
 
 `watch` polls the local `settings.json` and the gist, then reacts to the side that changed:
 
@@ -207,7 +223,7 @@ To run it at login instead of keeping a terminal open:
 hex-sync service install
 systemctl --user status hex-sync.service
 
-# Windows: creates a "HexGistSync" task that runs on logon and starts it now
+# Windows: creates a "HexSync" task that runs on logon and starts it now
 hex-sync service install
 ```
 
