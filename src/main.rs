@@ -71,7 +71,7 @@ enum CommandKind {
     Pull,
     Sync,
     Diff,
-    Watch { interval: u64 },
+    Watch { interval: u64, hidden: bool },
     History { revisions: bool },
     SelfUpdate { force: bool },
     ServiceInstall,
@@ -108,7 +108,7 @@ fn run() -> Result<()> {
         CommandKind::Pull => cmd_pull(&options),
         CommandKind::Sync => cmd_sync(&options),
         CommandKind::Diff => cmd_diff(&options),
-        CommandKind::Watch { interval } => cmd_watch(&options, *interval),
+        CommandKind::Watch { interval, hidden } => cmd_watch(&options, *interval, *hidden),
         CommandKind::History { revisions } => cmd_history(&options, *revisions),
         CommandKind::SelfUpdate { force } => cmd_self_update(*force),
         CommandKind::ServiceInstall => install_service(),
@@ -184,6 +184,7 @@ fn parse_args() -> Result<Options> {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(15);
+            let mut hidden = false;
 
             let mut index = 1;
             while index < args.len() {
@@ -200,6 +201,10 @@ fn parse_args() -> Result<Options> {
                         .parse()
                         .context("Interval must be a number of seconds")?;
                     index += 1;
+                } else if args[index] == "--hidden" {
+                    // Internal flag used by the Windows scheduled task to run without a console.
+                    hidden = true;
+                    index += 1;
                 } else {
                     bail!("Unknown watch option: {}", args[index]);
                 }
@@ -209,7 +214,7 @@ fn parse_args() -> Result<Options> {
                 bail!("Interval must be at least 1 second");
             }
 
-            CommandKind::Watch { interval }
+            CommandKind::Watch { interval, hidden }
         }
         Some("history") => {
             let revisions = args
@@ -1510,7 +1515,42 @@ fn cmd_history(options: &Options, revisions: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_watch(options: &Options, interval: u64) -> Result<()> {
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetConsoleWindow() -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+#[link(name = "user32")]
+extern "system" {
+    fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd_show: i32) -> i32;
+}
+
+/// Runs the daemon without a visible console window. Only used by the Windows
+/// scheduled task, so an interactive `hex-sync watch` still shows its output.
+#[cfg(target_os = "windows")]
+fn hide_console() {
+    const SW_HIDE: i32 = 0;
+
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console() {}
+
+fn cmd_watch(options: &Options, interval: u64, hidden: bool) -> Result<()> {
+    if hidden {
+        hide_console();
+    }
+
     require_auth()?;
 
     if !has_configured_gist(options) {
@@ -1718,9 +1758,17 @@ fn uninstall_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn install_service() -> Result<()> {
     let executable = env::current_exe()?.canonicalize()?;
-    let command = format!("\"{}\" watch", executable.display());
+    let command = format!("\"{}\" watch --hidden", executable.display());
+
+    // Stop an old visible daemon before replacing the task, so reinstalling in
+    // place also gets rid of a console window opened by a previous version.
+    let _ = Command::new("schtasks")
+        .args(["/End", "/TN", WINDOWS_TASK])
+        .stderr(Stdio::null())
+        .status();
 
     let created = Command::new("schtasks")
+        .stderr(Stdio::null())
         .args([
             "/Create",
             "/TN",
@@ -1737,7 +1785,18 @@ fn install_service() -> Result<()> {
         .context("Could not run schtasks")?;
 
     if !created.success() {
-        bail!("schtasks failed to create the task");
+        // Creating a task needs elevation on some systems, while updating an
+        // existing one does not. Fall back to that so reinstalls work without
+        // an elevated shell.
+        let changed = Command::new("schtasks")
+            .args(["/Change", "/TN", WINDOWS_TASK, "/TR", &command])
+            .stderr(Stdio::null())
+            .status()
+            .context("Could not run schtasks")?;
+
+        if !changed.success() {
+            bail!("schtasks failed to create or update the task");
+        }
     }
 
     let _ = Command::new("schtasks")

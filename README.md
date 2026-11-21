@@ -227,7 +227,7 @@ systemctl --user status hex-sync.service
 hex-sync service install
 ```
 
-Remove it with `hex-sync service uninstall`. On Linux this disables and deletes the service file; on Windows it deletes the scheduled task.
+Remove it with `hex-sync service uninstall`. On Linux this disables and deletes the service file; on Windows it deletes the scheduled task. On Windows the scheduled task starts the daemon with a hidden console, so no terminal window stays open. Running `hex-sync service install` again also stops the previous daemon and updates the task definition.
 
 The service inherits the gist ID from the local state file. If you rely on `HEX_GIST_*` environment variables instead, run `service install` from a shell where those variables are set so they can be written into the service definition. Authentication comes from the GitHub CLI config, so no token is stored in the service file.
 
